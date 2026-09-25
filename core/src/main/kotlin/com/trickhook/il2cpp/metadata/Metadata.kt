@@ -3,7 +3,13 @@ package com.trickhook.il2cpp.metadata
 import com.trickhook.il2cpp.io.BinaryReader
 import java.util.TreeMap
 
-class Metadata(val raw: ByteArray) {
+class Metadata(source: ByteArray) {
+
+    val obfuscationKey: Int = detectObfuscationKey(source)
+
+    val raw: ByteArray =
+        if (obfuscationKey == 0) source
+        else ByteArray(source.size) { (source[it].toInt() xor obfuscationKey).toByte() }
 
     private val reader = BinaryReader(raw)
     private var detectedVersion = 0.0
@@ -488,6 +494,35 @@ class Metadata(val raw: ByteArray) {
 
     private companion object {
         const val SANITY = 0xFAB11BAFL
+        private val SANITY_BYTES = byteArrayOf(0xAF.toByte(), 0x1B, 0xB1.toByte(), 0xFA.toByte())
+
+        fun detectObfuscationKey(source: ByteArray): Int {
+            if (source.size < 0x110) return 0
+            val key = (source[0].toInt() xor SANITY_BYTES[0].toInt()) and 0xFF
+            if (key == 0) return 0
+            for (i in SANITY_BYTES.indices) {
+                if (((source[i].toInt() xor SANITY_BYTES[i].toInt()) and 0xFF) != key) return 0
+            }
+            val version = readLittleInt(source, 4, key)
+            if (version !in MIN_VERSION..MAX_VERSION) return 0
+            var highest = 0L
+            var index = 8
+            while (index + 8 <= 0x110) {
+                val offset = readLittleInt(source, index, key)
+                val size = readLittleInt(source, index + 4, key)
+                if (offset < 0 || size < 0) return 0
+                if (offset > 0) highest = maxOf(highest, offset.toLong() + size)
+                index += 8
+            }
+            return if (highest in 1..source.size.toLong()) key else 0
+        }
+
+        private fun readLittleInt(source: ByteArray, at: Int, key: Int): Int =
+            ((source[at].toInt() xor key) and 0xFF) or
+                (((source[at + 1].toInt() xor key) and 0xFF) shl 8) or
+                (((source[at + 2].toInt() xor key) and 0xFF) shl 16) or
+                (((source[at + 3].toInt() xor key) and 0xFF) shl 24)
+
         const val MIN_VERSION = 16
         const val MAX_VERSION = 31
         const val V242_STRING_LITERAL_OFFSET = 264L

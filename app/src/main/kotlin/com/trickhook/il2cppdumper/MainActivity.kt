@@ -18,7 +18,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -31,6 +37,9 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -60,13 +69,37 @@ fun DumperScreen(model: DumperViewModel = viewModel()) {
 
     LaunchedEffect(Unit) { model.scan() }
 
-    Scaffold(topBar = { TopAppBar(title = { Text("Il2CppDumper") }) }) { padding ->
+    var tab by rememberSaveable { mutableIntStateOf(0) }
+
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("Il2CppDumper") }) },
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = tab == 0,
+                    onClick = { tab = 0 },
+                    icon = { Icon(Icons.Default.Build, contentDescription = null) },
+                    label = { Text("Dumper") }
+                )
+                NavigationBarItem(
+                    selected = tab == 1,
+                    onClick = { tab = 1 },
+                    icon = { Icon(Icons.Default.Info, contentDescription = null) },
+                    label = { Text("Creditos") }
+                )
+            }
+        }
+    ) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
                 .padding(16.dp)
         ) {
+            if (tab == 1) {
+                CreditsScreen()
+                return@Column
+            }
             when {
                 state.scanning -> Centered { CircularProgressIndicator() }
                 state.running || state.log.isNotEmpty() ->

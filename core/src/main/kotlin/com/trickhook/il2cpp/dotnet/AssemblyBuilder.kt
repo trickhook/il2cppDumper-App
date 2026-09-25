@@ -86,7 +86,7 @@ class AssemblyBuilder(
         val namespace: String,
         val name: String,
         val flags: Int,
-        val baseType: SigType?
+        var baseType: SigType?
     ) {
         val fields = mutableListOf<FieldDef>()
         val methods = mutableListOf<MethodDef>()
@@ -99,6 +99,10 @@ class AssemblyBuilder(
         var rid = 0
 
         fun asSig(isValueType: Boolean) = SigType.Named(Tbl.TYPE_DEF, rid, isValueType)
+    }
+
+    private companion object {
+        const val MODULE_TYPE = "<Module>"
     }
 
     private val tables = TableSet()
@@ -116,9 +120,18 @@ class AssemblyBuilder(
     /** Tipos que precisam de um TypeSpec porque nao sao uma simples TypeDef/TypeRef. */
     private val typeSpecs = LinkedHashMap<String, Int>()
 
-    init {
-        // O <Module> e sempre o primeiro TypeDef e nao tem conteudo.
-        defineType("", "<Module>", 0, null)
+    /**
+     * A norma exige que a primeira linha de TypeDef seja o pseudo-tipo
+     * <Module>. Quem alimenta o builder a partir de metadata IL2CPP ja tem um
+     * <Module> proprio na lista de tipos, entao criar outro aqui produziria um
+     * assembly com dois - por isso ele so aparece se o primeiro tipo declarado
+     * nao for um.
+     */
+    private fun ensureModuleType(name: String) {
+        if (types.isNotEmpty() || name == MODULE_TYPE) return
+        val t = TypeDef("", MODULE_TYPE, 0, null)
+        types += t
+        t.rid = 1
     }
 
     fun addAssemblyRef(name: String, major: Int, minor: Int, build: Int, revision: Int): Int =
@@ -169,6 +182,7 @@ class AssemblyBuilder(
     }
 
     fun defineType(namespace: String, name: String, flags: Int, baseType: SigType?): TypeDef {
+        ensureModuleType(name)
         val t = TypeDef(namespace, name, flags, baseType)
         types += t
         t.rid = types.size
@@ -360,27 +374,34 @@ class AssemblyBuilder(
         )
     }
 
+    /**
+     * GenericParam sai JA ordenado por (dono, numero), em vez de ser ordenado
+     * depois junto com as outras tabelas.
+     *
+     * Isto nao e preciosismo: GenericParamConstraint aponta para a linha de
+     * GenericParam pelo RID, e reordenar a tabela depois de gravar as
+     * restricoes faria cada restricao cair no parametro errado - em geral de
+     * outro tipo, cujo contexto nao resolve os !n da assinatura. O arquivo
+     * continua "valido" o bastante para abrir e so estoura quando alguem le as
+     * restricoes.
+     */
     private fun emitGenericParams() {
-        val pending = mutableListOf<Pair<GenericParamDef, Int>>()
+        val rows = mutableListOf<Triple<Int, GenericParamDef, Int>>()
         for (t in types) {
             for (g in t.genericParams) {
-                g.rid = tables.add(
-                    Tbl.GENERIC_PARAM, g.number, g.flags,
-                    Coded.TYPE_OR_METHOD_DEF.encode(Tbl.TYPE_DEF, t.rid), strings.add(g.name)
-                )
-                pending += g to g.rid
+                rows += Triple(Coded.TYPE_OR_METHOD_DEF.encode(Tbl.TYPE_DEF, t.rid), g, g.number)
             }
             for (m in t.methods) for (g in m.genericParams) {
-                g.rid = tables.add(
-                    Tbl.GENERIC_PARAM, g.number, g.flags,
-                    Coded.TYPE_OR_METHOD_DEF.encode(Tbl.METHOD_DEF, m.rid), strings.add(g.name)
-                )
-                pending += g to g.rid
+                rows += Triple(Coded.TYPE_OR_METHOD_DEF.encode(Tbl.METHOD_DEF, m.rid), g, g.number)
             }
         }
-        for ((g, rid) in pending) {
+        rows.sortWith(compareBy({ it.first }, { it.third }))
+        for ((owner, g, _) in rows) {
+            g.rid = tables.add(Tbl.GENERIC_PARAM, g.number, g.flags, owner, strings.add(g.name))
+        }
+        for ((_, g, _) in rows) {
             for (c in g.constraints) {
-                tables.add(Tbl.GENERIC_PARAM_CONSTRAINT, rid, encodeTypeDefOrRef(c))
+                tables.add(Tbl.GENERIC_PARAM_CONSTRAINT, g.rid, encodeTypeDefOrRef(c))
             }
         }
     }
@@ -428,7 +449,6 @@ class AssemblyBuilder(
         tables.sortBy(Tbl.CONSTANT, 2)
         tables.sortBy(Tbl.INTERFACE_IMPL, 0, 1)
         tables.sortBy(Tbl.NESTED_CLASS, 0)
-        tables.sortBy(Tbl.GENERIC_PARAM, 2, 0)
         tables.sortBy(Tbl.GENERIC_PARAM_CONSTRAINT, 0)
         tables.sortBy(Tbl.METHOD_SEMANTICS, 2)
     }

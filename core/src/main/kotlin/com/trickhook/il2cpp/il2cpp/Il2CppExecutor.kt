@@ -104,6 +104,16 @@ class Il2CppExecutor(val metadata: Metadata, val binary: Il2CppBinary) {
         return pointers.map { getTypeName(typeAt(it), false, false) }
     }
 
+    /**
+     * Os argumentos de uma instancia generica como TIPOS, e nao como nomes.
+     * O DummyDll precisa remonta-los numa assinatura, onde nome nao serve.
+     */
+    fun getGenericInstTypes(genericInst: Il2CppGenericInst): List<Il2CppType> {
+        val reader = readerAt(genericInst.typeArgv)
+        val pointers = LongArray(genericInst.typeArgc.toInt()) { reader.readPointer() }
+        return pointers.map { typeAt(it) }
+    }
+
     fun getTypeDefaultValue(type: Il2CppType, dataIndex: Int): String {
         val pointer = metadata.getDefaultValueData(dataIndex)
         val reader = BinaryReader(metadata.raw)

@@ -1,6 +1,7 @@
 package com.trickhook.il2cppdumper
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -43,6 +44,8 @@ class DumperViewModel(application: Application) : AndroidViewModel(application) 
 
     fun clearSelection() = _state.update { it.copy(selected = null) }
 
+    fun reset() = _state.update { it.copy(log = emptyList(), stage = "", selected = null) }
+
     fun cancel() {
         job?.cancel()
         job = null
@@ -62,11 +65,18 @@ class DumperViewModel(application: Application) : AndroidViewModel(application) 
                     DumpPipeline.run(
                         target = target,
                         outputDir = output,
-                        onStage = { stage -> _state.update { it.copy(stage = stage) } },
-                        onLog = { line -> _state.update { it.copy(log = it.log + line) } }
+                        onStage = { stage ->
+                            Log.i(TAG, "stage: $stage")
+                            _state.update { it.copy(stage = stage) }
+                        },
+                        onLog = { line ->
+                            Log.i(TAG, line)
+                            _state.update { it.copy(log = it.log + line) }
+                        }
                     )
                 }
             }.onFailure { error ->
+                Log.e(TAG, "falhou", error)
                 _state.update {
                     it.copy(
                         stage = "Falhou",
@@ -78,6 +88,10 @@ class DumperViewModel(application: Application) : AndroidViewModel(application) 
             }
             _state.update { it.copy(running = false) }
         }
+    }
+
+    private companion object {
+        const val TAG = "Il2CppDumper"
     }
 
     private fun outputDirFor(target: Il2CppTarget): File {

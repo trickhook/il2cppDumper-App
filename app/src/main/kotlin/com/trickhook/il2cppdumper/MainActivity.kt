@@ -69,7 +69,8 @@ fun DumperScreen(model: DumperViewModel = viewModel()) {
         ) {
             when {
                 state.scanning -> Centered { CircularProgressIndicator() }
-                state.running -> RunPanel(state, onCancel = model::cancel)
+                state.running || state.log.isNotEmpty() ->
+                    RunPanel(state, onCancel = model::cancel, onBack = model::reset)
                 state.selected != null -> TargetPanel(
                     state = state,
                     onBack = model::clearSelection,
@@ -161,11 +162,11 @@ private fun Field(label: String, value: String) {
 }
 
 @Composable
-private fun RunPanel(state: DumperState, onCancel: () -> Unit) {
+private fun RunPanel(state: DumperState, onCancel: () -> Unit, onBack: () -> Unit) {
     Column(modifier = Modifier.fillMaxSize()) {
         Text(state.stage, style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(8.dp))
-        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        if (state.running) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(16.dp))
         Column(
             modifier = Modifier
@@ -183,6 +184,7 @@ private fun RunPanel(state: DumperState, onCancel: () -> Unit) {
             }
         }
         Spacer(Modifier.height(12.dp))
-        OutlinedButton(onClick = onCancel) { Text("Cancelar") }
+        if (state.running) OutlinedButton(onClick = onCancel) { Text("Cancelar") }
+        else OutlinedButton(onClick = onBack) { Text("Voltar") }
     }
 }

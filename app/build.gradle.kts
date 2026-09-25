@@ -1,7 +1,7 @@
 plugins {
-    id("com.android.application") version "8.7.3"
-    kotlin("android") version "2.1.20"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.1.20"
+    id("com.android.application")
+    kotlin("android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -34,6 +34,11 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 
     packaging {

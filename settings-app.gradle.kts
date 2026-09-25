@@ -10,6 +10,13 @@ pluginManagement {
         id("org.jetbrains.kotlin.plugin.compose") version "2.1.20"
         id("com.android.application") version "8.7.3"
     }
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id.startsWith("com.android")) {
+                useModule("com.android.tools.build:gradle:8.7.3")
+            }
+        }
+    }
 }
 dependencyResolutionManagement {
     repositories {
@@ -19,3 +26,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "ff-il2cppdumper-mobile"
 include(":core")
+include(":app")

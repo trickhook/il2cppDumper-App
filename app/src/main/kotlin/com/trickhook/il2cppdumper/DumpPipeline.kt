@@ -15,16 +15,16 @@ object DumpPipeline {
         val library = ApkSource.readLibrary(target)
         onLog("libil2cpp.so  ${library.size} bytes  ${target.abi}")
 
-        val metadata = ApkSource.readMetadata(target)
-        onLog("global-metadata.dat  ${metadata.size} bytes")
-
         onStage("Desempacotando")
-        val unpack = FFProtector.tryUnpack(library)
+        val unpack = FFProtector.tryUnpack(library, inPlace = true)
         if (unpack.detected) {
             onLog(FFProtector.describe(unpack))
         } else {
             onLog("Nenhum protector detectado")
         }
+
+        val metadata = ApkSource.readMetadata(target)
+        onLog("global-metadata.dat  ${metadata.size} bytes")
 
         outputDir.mkdirs()
         onStage("Pronto")

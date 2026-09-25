@@ -7,6 +7,7 @@
 
     <application
         android:allowBackup="true"
+        android:largeHeap="true"
         android:icon="@android:drawable/ic_menu_search"
         android:label="Il2CppDumper"
         android:supportsRtl="true"

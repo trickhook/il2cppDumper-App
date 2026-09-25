@@ -1,3 +1,6 @@
 plugins {
-    kotlin("jvm") version "2.1.20" apply false
+    id("org.jetbrains.kotlin.jvm") apply false
+    id("org.jetbrains.kotlin.android") apply false
+    id("org.jetbrains.kotlin.plugin.compose") apply false
+    id("com.android.application") apply false
 }

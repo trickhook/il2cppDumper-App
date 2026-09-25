@@ -49,6 +49,8 @@ object FFProtector {
 
     private const val OBFUSCATION_CONSTANT = 0x4F
 
+    private const val GROUP_SIZE = 8
+    private const val FIRST_GROUP_INDEX = 2
     private const val WINDOW_SIZE = 0x4000
     private const val SLOT_STRIDE = 0x10000
     private const val FIRST_WINDOW_PHASE = 0x2000
@@ -108,7 +110,7 @@ object FFProtector {
         return null
     }
 
-    fun tryUnpack(data: ByteArray, enabled: Boolean = true): UnpackResult {
+    fun tryUnpack(data: ByteArray, enabled: Boolean = true, inPlace: Boolean = false): UnpackResult {
         val descriptor = findDescriptor(data)
             ?: return emptyResult(data, detected = false, descriptor = null)
 
@@ -144,7 +146,7 @@ object FFProtector {
         val key = if (selected == 0) FALLBACK_XOR_KEY else selected
         val keyByte = key.toByte()
 
-        val out = data.copyOf()
+        val out = if (inPlace) data else data.copyOf()
 
         var window0Method = "not attempted"
         var aesSeed = 0L
@@ -184,25 +186,67 @@ object FFProtector {
             val n = windows.size
             val lastGroupStart = 2 + 8 * ((n - 2) / 8)
 
-            for ((index, dst) in windows) {
-                if (index == 0) continue
+            val scratch = ByteArray(GROUP_SIZE * WINDOW_SIZE)
 
-                val delta = if (!permute || index >= lastGroupStart) 0L
-                else SLOT_DELTA[index % SLOT_DELTA.size].toLong() * SLOT_STRIDE
-                val srcPos = dst + delta
-
-                val len = if (index == n - 1) (end - dst).toInt()
+            fun windowLength(index: Int, dst: Long) =
+                if (index == n - 1) (end - dst).toInt()
                 else minOf(WINDOW_SIZE.toLong(), end - dst).toInt()
 
-                if (srcPos < start || srcPos + len > end) {
-                    skipped++
-                    unrecovered += len
+            fun copyWindow(index: Int, dst: Long, from: ByteArray, fromOffset: Int, len: Int): Boolean {
+                if (len <= 0) return false
+                val to = dst.toInt()
+                for (i in 0 until len) out[to + i] = (from[fromOffset + i].toInt() xor key).toByte()
+                return true
+            }
+
+            var index = 1
+            while (index < n) {
+                val dst = windows[index].start
+                val permuted = permute && index >= FIRST_GROUP_INDEX && index < lastGroupStart
+                if (!permuted) {
+                    val len = windowLength(index, dst)
+                    if (len <= 0 || dst < start || dst + len > end) {
+                        skipped++
+                        unrecovered += maxOf(len, 0)
+                    } else {
+                        copyWindow(index, dst, data, dst.toInt(), len)
+                        recovered++
+                    }
+                    index++
                     continue
                 }
-                val from = srcPos.toInt()
-                val to = dst.toInt()
-                for (i in 0 until len) out[to + i] = (data[from + i].toInt() xor key).toByte()
-                recovered++
+
+                val groupEnd = minOf(index + GROUP_SIZE, lastGroupStart)
+                var member = index
+                var staged = 0
+                while (member < groupEnd) {
+                    val source = windows[member].start +
+                        SLOT_DELTA[member % SLOT_DELTA.size].toLong() * SLOT_STRIDE
+                    val len = windowLength(member, windows[member].start)
+                    if (source >= start && source + len <= end && len > 0) {
+                        System.arraycopy(data, source.toInt(), scratch, staged * WINDOW_SIZE, len)
+                    }
+                    staged++
+                    member++
+                }
+
+                member = index
+                staged = 0
+                while (member < groupEnd) {
+                    val memberDst = windows[member].start
+                    val source = memberDst + SLOT_DELTA[member % SLOT_DELTA.size].toLong() * SLOT_STRIDE
+                    val len = windowLength(member, memberDst)
+                    if (source < start || source + len > end || len <= 0) {
+                        skipped++
+                        unrecovered += maxOf(len, 0)
+                    } else {
+                        copyWindow(member, memberDst, scratch, staged * WINDOW_SIZE, len)
+                        recovered++
+                    }
+                    staged++
+                    member++
+                }
+                index = groupEnd
             }
         }
 

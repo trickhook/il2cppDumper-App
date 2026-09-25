@@ -31,6 +31,8 @@ data class UnpackResult(
     val keySource: String,
     val aesSeed: Long,
     val window0Method: String,
+    val permutation: IntArray,
+    val permutationSource: String,
     val windowsTotal: Int,
     val windowsRecovered: Int,
     val windowsSkipped: Int,
@@ -80,7 +82,13 @@ object FFProtector {
         0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11
     )
 
-    private val SLOT_DELTA = intArrayOf(-1, 0, 4, -1, 4, -1, -3, -2)
+    private val IDENTITY = intArrayOf(0, 1, 2, 3, 4, 5, 6, 7)
+
+    private val KNOWN_PERMUTATIONS = listOf(
+        intArrayOf(4, 0, 6, 2, 1, 3, 5, 7),
+        intArrayOf(3, 4, 0, 2, 6, 1, 5, 7),
+        IDENTITY
+    )
 
     fun findDescriptor(data: ByteArray): ProtectorDescriptor? {
         var i = 0L
@@ -121,7 +129,7 @@ object FFProtector {
         val windows = enumerateWindows(start, end)
         if (windows.isEmpty()) return emptyResult(data, detected = true, descriptor = descriptor)
 
-        val dominant = mostFrequentByte(data, windows, start, end)
+        val dominant = mostFrequentByte(data, windows, end)
         if (dominant == 0) {
             return emptyResult(data, detected = true, descriptor = descriptor, windowsTotal = windows.size)
         }
@@ -134,7 +142,7 @@ object FFProtector {
             fromByte != 0 && fromByte == fromBlob -> "descriptor"
             fromByte != 0 && fromByte == dominant -> "descriptor + histogram"
             fromBlob != 0 && fromBlob == dominant -> "key blob + histogram"
-            bestByTextScore(data, windows, start, end) == dominant -> "histogram"
+            bestByTextScore(data, windows, end) == dominant -> "histogram"
             else -> null
         } ?: return emptyResult(data, detected = true, descriptor = descriptor, windowsTotal = windows.size)
 
@@ -144,15 +152,28 @@ object FFProtector {
             else -> dominant
         }
         val key = if (selected == 0) FALLBACK_XOR_KEY else selected
-        val keyByte = key.toByte()
 
         val out = if (inPlace) data else data.copyOf()
+        val n = windows.size
 
         var window0Method = "not attempted"
         var aesSeed = 0L
         var recovered = 0
         var skipped = 0
         var unrecovered = 0L
+        var sigma = IDENTITY
+        var sigmaSource = "identity"
+
+        fun windowLength(index: Int): Int {
+            val dst = windows[index].start
+            return if (index == n - 1) (end - dst).toInt()
+            else minOf(WINDOW_SIZE.toLong(), end - dst).toInt()
+        }
+
+        fun copyWindow(dst: Long, from: ByteArray, fromOffset: Int, len: Int) {
+            val to = dst.toInt()
+            for (i in 0 until len) out[to + i] = (from[fromOffset + i].toInt() xor key).toByte()
+        }
 
         if (descriptor.size < SMALL_SECTION_LIMIT) {
             var i = windows[0].start
@@ -160,8 +181,9 @@ object FFProtector {
                 out[i.toInt()] = (data[i.toInt()].toInt() xor key).toByte()
                 i++
             }
-            recovered = windows.size
+            recovered = n
             window0Method = "n/a (small section, plain XOR)"
+            sigmaSource = "n/a (small section)"
         } else {
             val w0 = windows[0].start
             val w0Len = minOf(WINDOW_SIZE.toLong(), end - w0).toInt()
@@ -182,69 +204,59 @@ object FFProtector {
                 unrecovered += w0Len
             }
 
-            val permute = descriptor.algo != 2L
-            val n = windows.size
-            val lastGroupStart = 2 + 8 * ((n - 2) / 8)
+            val lastGroupStart = FIRST_GROUP_INDEX + GROUP_SIZE * ((n - FIRST_GROUP_INDEX) / GROUP_SIZE)
 
-            val scratch = ByteArray(GROUP_SIZE * WINDOW_SIZE)
-
-            fun windowLength(index: Int, dst: Long) =
-                if (index == n - 1) (end - dst).toInt()
-                else minOf(WINDOW_SIZE.toLong(), end - dst).toInt()
-
-            fun copyWindow(index: Int, dst: Long, from: ByteArray, fromOffset: Int, len: Int): Boolean {
-                if (len <= 0) return false
-                val to = dst.toInt()
-                for (i in 0 until len) out[to + i] = (from[fromOffset + i].toInt() xor key).toByte()
-                return true
+            for (index in 1 until n) {
+                if (index >= FIRST_GROUP_INDEX && index < lastGroupStart) continue
+                val dst = windows[index].start
+                val len = windowLength(index)
+                if (len <= 0) {
+                    skipped++
+                } else {
+                    copyWindow(dst, data, dst.toInt(), len)
+                    recovered++
+                }
             }
 
-            var index = 1
-            while (index < n) {
-                val dst = windows[index].start
-                val permuted = permute && index >= FIRST_GROUP_INDEX && index < lastGroupStart
-                if (!permuted) {
-                    val len = windowLength(index, dst)
-                    if (len <= 0 || dst < start || dst + len > end) {
-                        skipped++
-                        unrecovered += maxOf(len, 0)
-                    } else {
-                        copyWindow(index, dst, data, dst.toInt(), len)
-                        recovered++
-                    }
-                    index++
-                    continue
-                }
+            val solved = solvePermutation(data, out, windows, start, end, lastGroupStart, key, descriptor.checksum)
+            if (solved != null) {
+                sigma = solved.first
+                sigmaSource = solved.second
+            } else if (descriptor.algo != 2L) {
+                sigma = KNOWN_PERMUTATIONS[0]
+                sigmaSource = "fallback table"
+            } else {
+                sigmaSource = "identity (algo 2)"
+            }
 
+            val scratch = ByteArray(GROUP_SIZE * WINDOW_SIZE)
+            var index = FIRST_GROUP_INDEX
+            while (index < lastGroupStart) {
                 val groupEnd = minOf(index + GROUP_SIZE, lastGroupStart)
-                var member = index
-                var staged = 0
-                while (member < groupEnd) {
-                    val source = windows[member].start +
-                        SLOT_DELTA[member % SLOT_DELTA.size].toLong() * SLOT_STRIDE
-                    val len = windowLength(member, windows[member].start)
-                    if (source >= start && source + len <= end && len > 0) {
-                        System.arraycopy(data, source.toInt(), scratch, staged * WINDOW_SIZE, len)
+                val members = groupEnd - index
+
+                for (p in 0 until members) {
+                    val source = index + sigma[p]
+                    if (source >= n) continue
+                    val len = windowLength(index + p)
+                    val at = windows[source].start
+                    if (len > 0 && at + len <= end) {
+                        System.arraycopy(data, at.toInt(), scratch, p * WINDOW_SIZE, len)
                     }
-                    staged++
-                    member++
                 }
 
-                member = index
-                staged = 0
-                while (member < groupEnd) {
-                    val memberDst = windows[member].start
-                    val source = memberDst + SLOT_DELTA[member % SLOT_DELTA.size].toLong() * SLOT_STRIDE
-                    val len = windowLength(member, memberDst)
-                    if (source < start || source + len > end || len <= 0) {
+                for (p in 0 until members) {
+                    val member = index + p
+                    val source = index + sigma[p]
+                    val len = windowLength(member)
+                    val at = if (source < n) windows[source].start else -1L
+                    if (len <= 0 || at < start || at + len > end) {
                         skipped++
                         unrecovered += maxOf(len, 0)
                     } else {
-                        copyWindow(member, memberDst, scratch, staged * WINDOW_SIZE, len)
+                        copyWindow(windows[member].start, scratch, p * WINDOW_SIZE, len)
                         recovered++
                     }
-                    staged++
-                    member++
                 }
                 index = groupEnd
             }
@@ -257,11 +269,13 @@ object FFProtector {
             detected = true,
             unpacked = true,
             descriptor = descriptor,
-            key = keyByte.toInt() and 0xFF,
+            key = key,
             keySource = keySource,
             aesSeed = aesSeed,
             window0Method = window0Method,
-            windowsTotal = windows.size,
+            permutation = sigma,
+            permutationSource = sigmaSource,
+            windowsTotal = n,
             windowsRecovered = recovered,
             windowsSkipped = skipped,
             checksumVerified = actualCrc == expectedCrc,
@@ -283,6 +297,7 @@ object FFProtector {
         lines += "  Unpacked with key 0x${hex2(result.key)} (from ${result.keySource}), " +
             "window 0 via ${result.window0Method}$seedPart: " +
             "${result.windowsRecovered}/${result.windowsTotal} windows recovered"
+        lines += "  Window permutation ${result.permutation.joinToString(",")} (${result.permutationSource})"
         if (result.checksumVerified) {
             lines += "  CRC32 matches the descriptor (0x${hex8(result.expectedCrc).uppercase()}) - section is byte-exact."
         } else {
@@ -291,6 +306,75 @@ object FFProtector {
             lines += "  Dump the library from memory instead."
         }
         return lines.joinToString("\n")
+    }
+
+    private fun solvePermutation(
+        data: ByteArray,
+        out: ByteArray,
+        windows: List<Window>,
+        start: Long,
+        end: Long,
+        lastGroupStart: Int,
+        key: Int,
+        target: Long
+    ): Pair<IntArray, String>? {
+        val count = lastGroupStart - FIRST_GROUP_INDEX
+        if (count <= 0) return null
+        if (windows[lastGroupStart - 1].start + WINDOW_SIZE > end) return null
+
+        val total = (end - start).toInt()
+        val zeroCrc = Crc32Affine.of(ByteArray(WINDOW_SIZE), 0, WINDOW_SIZE)
+        val keyCrc = Crc32Affine.of(ByteArray(WINDOW_SIZE) { key.toByte() }, 0, WINDOW_SIZE)
+
+        var base = Crc32Affine.of(out, start.toInt(), total)
+        val rests = LongArray(count)
+        for (k in 0 until count) {
+            val at = windows[FIRST_GROUP_INDEX + k].start
+            val rest = total.toLong() - (at - start) - WINDOW_SIZE
+            rests[k] = rest
+            val present = Crc32Affine.of(out, at.toInt(), WINDOW_SIZE) xor zeroCrc
+            base = base xor Crc32Affine.combine(present, 0L, rest)
+        }
+
+        val aggregate = Array(GROUP_SIZE) { LongArray(GROUP_SIZE) }
+        for (k in 0 until count) {
+            val groupBase = FIRST_GROUP_INDEX + GROUP_SIZE * (k / GROUP_SIZE)
+            val p = k % GROUP_SIZE
+            for (j in 0 until GROUP_SIZE) {
+                val at = windows[groupBase + j].start
+                val term = Crc32Affine.of(data, at.toInt(), WINDOW_SIZE) xor keyCrc
+                aggregate[p][j] = aggregate[p][j] xor Crc32Affine.combine(term, 0L, rests[k])
+            }
+        }
+
+        fun evaluate(sigma: IntArray): Long {
+            var acc = base
+            for (p in 0 until GROUP_SIZE) acc = acc xor aggregate[p][sigma[p]]
+            return acc
+        }
+
+        for (known in KNOWN_PERMUTATIONS) {
+            if (evaluate(known) == target) {
+                return known to if (known === IDENTITY) "identity, CRC32 verified" else "known table, CRC32 verified"
+            }
+        }
+
+        val sigma = IntArray(GROUP_SIZE)
+        val used = BooleanArray(GROUP_SIZE)
+
+        fun search(p: Int, acc: Long): Boolean {
+            if (p == GROUP_SIZE) return acc == target
+            for (j in 0 until GROUP_SIZE) {
+                if (used[j]) continue
+                used[j] = true
+                sigma[p] = j
+                if (search(p + 1, acc xor aggregate[p][j])) return true
+                used[j] = false
+            }
+            return false
+        }
+
+        return if (search(0, base)) sigma to "solved from CRC32" else null
     }
 
     private fun emptyResult(
@@ -306,6 +390,8 @@ object FFProtector {
         keySource = "",
         aesSeed = 0L,
         window0Method = "not attempted",
+        permutation = IDENTITY,
+        permutationSource = "",
         windowsTotal = windowsTotal,
         windowsRecovered = 0,
         windowsSkipped = 0,
@@ -402,13 +488,11 @@ object FFProtector {
         return list
     }
 
-    private fun mostFrequentByte(data: ByteArray, windows: List<Window>, start: Long, end: Long): Int {
+    private fun mostFrequentByte(data: ByteArray, windows: List<Window>, end: Long): Int {
         val histogram = LongArray(256)
-        for ((index, dst) in windows) {
-            val src = dst + SLOT_DELTA[index % SLOT_DELTA.size].toLong() * SLOT_STRIDE
-            if (src < start) continue
-            val len = minOf(WINDOW_SIZE.toLong(), end - src).toInt()
-            val base = src.toInt()
+        for ((_, at) in windows) {
+            val len = minOf(WINDOW_SIZE.toLong(), end - at).toInt()
+            val base = at.toInt()
             for (i in 0 until len) histogram[data[base + i].toInt() and 0xFF]++
         }
         var best = 0
@@ -416,11 +500,10 @@ object FFProtector {
         return best
     }
 
-    private fun bestByTextScore(data: ByteArray, windows: List<Window>, start: Long, end: Long): Int {
+    private fun bestByTextScore(data: ByteArray, windows: List<Window>, end: Long): Int {
         val sample = 512
-        val sources = windows.mapNotNull { (index, dst) ->
-            val src = dst + SLOT_DELTA[index % SLOT_DELTA.size].toLong() * SLOT_STRIDE
-            if (src < start || src + sample > end) null else src.toInt()
+        val sources = windows.mapNotNull { (_, at) ->
+            if (at + sample > end) null else at.toInt()
         }
         var best = 0
         var bestScore = -1L

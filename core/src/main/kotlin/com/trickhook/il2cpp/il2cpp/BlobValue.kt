@@ -4,6 +4,7 @@ import java.math.BigDecimal
 import java.math.MathContext
 import java.math.RoundingMode
 import java.text.DecimalFormatSymbols
+import java.util.Locale
 import kotlin.math.abs
 
 data class BlobValue(
@@ -14,14 +15,19 @@ data class BlobValue(
 
 internal object ManagedNumber {
 
+    // dump.cs e codigo, nao texto pro usuario: o separador decimal e o simbolo
+    // de infinito tem que ser os mesmos em qualquer aparelho. Sao os que o
+    // Il2CppDumper original emite (cultura invariante do .NET).
+    private const val INFINITY = "Infinity"
+
     private const val SINGLE_PRECISION = 9
     private const val DOUBLE_PRECISION = 17
 
     fun format(value: Float): String {
-        val symbols = DecimalFormatSymbols.getInstance()
+        val symbols = DecimalFormatSymbols.getInstance(Locale.ROOT)
         if (value.isNaN()) return symbols.naN
-        if (value == Float.POSITIVE_INFINITY) return symbols.infinity
-        if (value == Float.NEGATIVE_INFINITY) return "-" + symbols.infinity
+        if (value == Float.POSITIVE_INFINITY) return INFINITY
+        if (value == Float.NEGATIVE_INFINITY) return "-" + INFINITY
         val negative = value.toRawBits() < 0
         val magnitude = abs(value)
         if (magnitude == 0.0f) return if (negative) "-0" else "0"
@@ -38,10 +44,10 @@ internal object ManagedNumber {
     }
 
     fun format(value: Double): String {
-        val symbols = DecimalFormatSymbols.getInstance()
+        val symbols = DecimalFormatSymbols.getInstance(Locale.ROOT)
         if (value.isNaN()) return symbols.naN
-        if (value == Double.POSITIVE_INFINITY) return symbols.infinity
-        if (value == Double.NEGATIVE_INFINITY) return "-" + symbols.infinity
+        if (value == Double.POSITIVE_INFINITY) return INFINITY
+        if (value == Double.NEGATIVE_INFINITY) return "-" + INFINITY
         val negative = value.toRawBits() < 0
         val magnitude = abs(value)
         if (magnitude == 0.0) return if (negative) "-0" else "0"

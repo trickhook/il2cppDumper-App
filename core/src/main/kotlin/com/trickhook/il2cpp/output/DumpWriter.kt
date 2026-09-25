@@ -21,6 +21,7 @@ import com.trickhook.il2cpp.il2cpp.Il2CppConstants.TYPE_ATTRIBUTE_SERIALIZABLE
 import com.trickhook.il2cpp.il2cpp.Il2CppConstants.TYPE_ATTRIBUTE_VISIBILITY_MASK
 import com.trickhook.il2cpp.il2cpp.Il2CppExecutor
 import com.trickhook.il2cpp.il2cpp.Il2CppType
+import com.trickhook.il2cpp.il2cpp.ManagedNumber
 import com.trickhook.il2cpp.io.BinaryReader
 import com.trickhook.il2cpp.metadata.Il2CppImageDefinition
 import com.trickhook.il2cpp.metadata.Il2CppTypeDefinition
@@ -28,10 +29,6 @@ import java.io.BufferedWriter
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.io.Writer
-import java.math.BigDecimal
-import java.math.MathContext
-import java.math.RoundingMode
-import java.text.DecimalFormatSymbols
 import java.util.Locale
 import kotlin.math.abs
 
@@ -426,82 +423,6 @@ class DumpWriter(private val executor: Il2CppExecutor, private val options: Dump
             }
         }
         return builder.toString()
-    }
-
-    private object ManagedNumber {
-
-        private const val SINGLE_PRECISION = 9
-        private const val DOUBLE_PRECISION = 17
-
-        fun format(value: Float): String {
-            val symbols = DecimalFormatSymbols.getInstance(Locale.ROOT)
-            if (value.isNaN()) return symbols.naN
-            if (value == Float.POSITIVE_INFINITY) return symbols.infinity
-            if (value == Float.NEGATIVE_INFINITY) return "-" + symbols.infinity
-            val negative = value.toRawBits() < 0
-            val magnitude = abs(value)
-            if (magnitude == 0.0f) return if (negative) "-0" else "0"
-            val exact = BigDecimal(magnitude.toDouble())
-            var shortest = exact.round(MathContext(SINGLE_PRECISION, RoundingMode.HALF_EVEN))
-            for (precision in 1 until SINGLE_PRECISION) {
-                val candidate = exact.round(MathContext(precision, RoundingMode.HALF_EVEN))
-                if (candidate.toString().toFloat() == magnitude) {
-                    shortest = candidate
-                    break
-                }
-            }
-            return render(negative, shortest.stripTrailingZeros(), SINGLE_PRECISION, symbols.decimalSeparator)
-        }
-
-        fun format(value: Double): String {
-            val symbols = DecimalFormatSymbols.getInstance(Locale.ROOT)
-            if (value.isNaN()) return symbols.naN
-            if (value == Double.POSITIVE_INFINITY) return symbols.infinity
-            if (value == Double.NEGATIVE_INFINITY) return "-" + symbols.infinity
-            val negative = value.toRawBits() < 0
-            val magnitude = abs(value)
-            if (magnitude == 0.0) return if (negative) "-0" else "0"
-            val exact = BigDecimal(magnitude)
-            var shortest = exact.round(MathContext(DOUBLE_PRECISION, RoundingMode.HALF_EVEN))
-            for (precision in 1 until DOUBLE_PRECISION) {
-                val candidate = exact.round(MathContext(precision, RoundingMode.HALF_EVEN))
-                if (candidate.toString().toDouble() == magnitude) {
-                    shortest = candidate
-                    break
-                }
-            }
-            return render(negative, shortest.stripTrailingZeros(), DOUBLE_PRECISION, symbols.decimalSeparator)
-        }
-
-        private fun render(negative: Boolean, value: BigDecimal, precision: Int, separator: Char): String {
-            val digits = value.unscaledValue().toString()
-            val scale = digits.length - value.scale()
-            val exponent = scale - 1
-            val builder = StringBuilder(digits.length + 8)
-            if (negative) builder.append('-')
-            if (exponent > -5 && exponent < precision) {
-                when {
-                    scale <= 0 -> {
-                        builder.append('0').append(separator)
-                        repeat(-scale) { builder.append('0') }
-                        builder.append(digits)
-                    }
-                    scale >= digits.length -> {
-                        builder.append(digits)
-                        repeat(scale - digits.length) { builder.append('0') }
-                    }
-                    else -> builder.append(digits, 0, scale).append(separator).append(digits, scale, digits.length)
-                }
-            } else {
-                builder.append(digits[0])
-                if (digits.length > 1) builder.append(separator).append(digits, 1, digits.length)
-                builder.append('E').append(if (exponent < 0) '-' else '+')
-                val magnitude = abs(exponent)
-                if (magnitude < 10) builder.append('0')
-                builder.append(magnitude)
-            }
-            return builder.toString()
-        }
     }
 
     private companion object {

@@ -40,7 +40,20 @@ object DumpPipeline {
         onLog("ELF ${if (elf.is64) 64 else 32} bits, ${elf.segments.size} segmentos")
 
         onStage("Lendo o metadata")
-        val metadata = Metadata(ApkSource.readMetadata(target))
+        val metadataBytes = ApkSource.readMetadata(target)
+        val metadata = runCatching { Metadata(metadataBytes) }.getOrElse { error ->
+            val magic = if (metadataBytes.size >= 4) {
+                (metadataBytes[0].toInt() and 0xFF) or ((metadataBytes[1].toInt() and 0xFF) shl 8) or
+                    ((metadataBytes[2].toInt() and 0xFF) shl 16) or ((metadataBytes[3].toInt() and 0xFF) shl 24)
+            } else 0
+            if (magic != -0x54ee451) {
+                throw IllegalStateException(
+                    "global-metadata.dat esta criptografado ou nao e IL2CPP " +
+                        "(magic 0x${magic.toUInt().toString(16)}). Este jogo nao da pra dumpar so do APK."
+                )
+            }
+            throw error
+        }
         onLog("metadata v${metadata.version}, ${metadata.typeDefs.size} tipos, ${metadata.methodDefs.size} metodos")
         val layout = metadata.methodDefLayout
         if (!layout.isStandard) {

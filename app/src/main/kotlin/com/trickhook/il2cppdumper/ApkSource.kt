@@ -3,6 +3,7 @@ package com.trickhook.il2cppdumper
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.Build
 import java.io.File
 import java.util.zip.ZipFile
 
@@ -19,10 +20,12 @@ data class Il2CppTarget(
 
 object ApkSource {
 
-    private const val METADATA_ENTRY = "assets/bin/Data/Managed/Metadata/global-metadata.dat"
+    private const val METADATA_NAME = "global-metadata.dat"
     private const val LIBRARY_NAME = "libil2cpp.so"
 
-    private val preferredAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+    private val abiOrder: List<String>
+        get() = (Build.SUPPORTED_ABIS.toList() + listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86"))
+            .distinct()
 
     fun scan(context: Context): List<Il2CppTarget> {
         val pm = context.packageManager
@@ -48,8 +51,8 @@ object ApkSource {
             abi = library.abi,
             libraryPath = library.path,
             librarySource = library.source,
-            metadataSource = metadata,
-            metadataEntry = METADATA_ENTRY
+            metadataSource = metadata.first,
+            metadataEntry = metadata.second
         )
     }
 
@@ -67,7 +70,7 @@ object ApkSource {
         if (extracted != null && extracted.canRead() && extracted.length() > 0) {
             return LibraryLocation(File(info.nativeLibraryDir).name, extracted.absolutePath, "")
         }
-        for (abi in preferredAbis) {
+        for (abi in abiOrder) {
             val entry = "lib/$abi/$LIBRARY_NAME"
             for (apk in apks) {
                 if (hasEntry(apk, entry)) return LibraryLocation(abi, entry, apk)
@@ -76,8 +79,19 @@ object ApkSource {
         return null
     }
 
-    private fun findMetadata(apks: List<String>): String? =
-        apks.firstOrNull { hasEntry(it, METADATA_ENTRY) }
+    private fun findMetadata(apks: List<String>): Pair<String, String>? {
+        for (apk in apks) {
+            val entry = runCatching {
+                ZipFile(apk).use { zip ->
+                    zip.entries().asSequence()
+                        .map { it.name }
+                        .firstOrNull { it.endsWith("/$METADATA_NAME") || it == METADATA_NAME }
+                }
+            }.getOrNull()
+            if (entry != null) return apk to entry
+        }
+        return null
+    }
 
     private fun hasEntry(apk: String, entry: String): Boolean =
         runCatching { ZipFile(apk).use { it.getEntry(entry) != null } }.getOrDefault(false)

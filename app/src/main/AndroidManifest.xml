@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission"
+        xmlns:tools="http://schemas.android.com/tools" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@android:drawable/ic_menu_search"
+        android:label="Il2CppDumper"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Il2CppDumper">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="Il2CppDumper"
+            android:theme="@style/Theme.Il2CppDumper">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>

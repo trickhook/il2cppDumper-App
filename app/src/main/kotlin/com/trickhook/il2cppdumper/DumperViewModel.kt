@@ -65,6 +65,7 @@ class DumperViewModel(application: Application) : AndroidViewModel(application) 
                     DumpPipeline.run(
                         target = target,
                         outputDir = output,
+                        dummyDllAttributes = readDummyDllAttributes(),
                         onStage = { stage ->
                             Log.i(TAG, "stage: $stage")
                             _state.update { it.copy(stage = stage) }
@@ -98,5 +99,17 @@ class DumperViewModel(application: Application) : AndroidViewModel(application) 
         val base = getApplication<Application>().getExternalFilesDir(null)
             ?: getApplication<Application>().filesDir
         return File(base, target.packageName).apply { mkdirs() }
+    }
+
+    /**
+     * O assembly que define os atributos do DummyDll. Ele nao e gerado: vai
+     * junto no APK e e copiado para a saida, porque todos os outros assemblies
+     * referenciam os cinco atributos dele.
+     */
+    private fun readDummyDllAttributes(): ByteArray? = runCatching {
+        getApplication<Application>().assets.open("Il2CppDummyDll.dll").use { it.readBytes() }
+    }.getOrElse {
+        Log.w(TAG, "Il2CppDummyDll.dll ausente nos assets", it)
+        null
     }
 }

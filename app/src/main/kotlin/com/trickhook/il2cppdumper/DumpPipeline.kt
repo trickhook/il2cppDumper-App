@@ -5,6 +5,7 @@ import com.trickhook.il2cpp.il2cpp.Il2CppBinary
 import com.trickhook.il2cpp.il2cpp.Il2CppExecutor
 import com.trickhook.il2cpp.metadata.Metadata
 import com.trickhook.il2cpp.output.DumpOptions
+import com.trickhook.il2cpp.output.DummyDllWriter
 import com.trickhook.il2cpp.output.DumpWriter
 import com.trickhook.il2cpp.output.HeaderWriter
 import com.trickhook.il2cpp.output.ScriptWriter
@@ -21,7 +22,8 @@ object DumpPipeline {
         target: Il2CppTarget,
         outputDir: File,
         onStage: (String) -> Unit,
-        onLog: (String) -> Unit
+        onLog: (String) -> Unit,
+        dummyDllAttributes: ByteArray? = null
     ) {
         outputDir.mkdirs()
         val started = System.currentTimeMillis()
@@ -71,9 +73,51 @@ object DumpPipeline {
         write(outputDir, "stringliteral.json", onStage, onLog) { ScriptWriter(executor).writeStringLiterals(it) }
         write(outputDir, "il2cpp.h", onStage, onLog) { HeaderWriter(executor).write(it) }
 
+        writeDummyDll(outputDir, executor, dummyDllAttributes, onStage, onLog)
+
         onStage("Concluido")
         onLog("Total ${(System.currentTimeMillis() - started) / 1000}s")
         onLog(outputDir.absolutePath)
+    }
+
+    /**
+     * Grava os assemblies do DummyDll. Eles saem um de cada vez porque o
+     * Assembly-CSharp de um jogo grande sozinho passa de 80 MB.
+     *
+     * O Il2CppDummyDll.dll nao e gerado: ele so define os cinco atributos que
+     * os outros assemblies referenciam e vai junto como asset, exatamente o
+     * mesmo arquivo que o dumper de PC usa.
+     */
+    private fun writeDummyDll(
+        outputDir: File,
+        executor: Il2CppExecutor,
+        attributes: ByteArray?,
+        onStage: (String) -> Unit,
+        onLog: (String) -> Unit
+    ) {
+        onStage("Gerando DummyDll")
+        val started = System.currentTimeMillis()
+        val dir = File(outputDir, "DummyDll")
+        dir.deleteRecursively()
+        dir.mkdirs()
+        attributes?.let { File(dir, "Il2CppDummyDll.dll").writeBytes(it) }
+
+        val writer = DummyDllWriter(executor)
+        var total = 0L
+        var count = 0
+        writer.forEachAssembly { name, bytes ->
+            File(dir, name).writeBytes(bytes)
+            total += bytes.size
+            count++
+        }
+        val seconds = (System.currentTimeMillis() - started) / 1000.0
+        onLog("DummyDll  $count assemblies  $total bytes  ${"%.1f".format(seconds)}s")
+        if (writer.skippedAssemblies.isNotEmpty()) {
+            onLog("  sem memoria para: ${writer.skippedAssemblies.joinToString(", ")}")
+        }
+        if (writer.outOfRangeGenericParams > 0) {
+            onLog("  ${writer.outOfRangeGenericParams} genericos fora de alcance viraram object")
+        }
     }
 
     private fun write(

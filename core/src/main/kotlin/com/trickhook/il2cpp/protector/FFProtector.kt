@@ -229,7 +229,13 @@ object FFProtector {
                 sigmaSource = "identity (algo 2)"
             }
 
-            val scratch = ByteArray(GROUP_SIZE * WINDOW_SIZE)
+            // A ultima janela da secao nao e cortada em WINDOW_SIZE. Quando ela
+            // cai dentro da faixa permutada ela fica sempre na posicao 7 do
+            // grupo, e um buffer de GROUP_SIZE * WINDOW_SIZE estoura. Dimensiona
+            // pela maior janela que realmente vai ser encenada.
+            val longestMember = (FIRST_GROUP_INDEX until lastGroupStart)
+                .maxOfOrNull { windowLength(it) } ?: WINDOW_SIZE
+            val scratch = ByteArray((GROUP_SIZE - 1) * WINDOW_SIZE + maxOf(WINDOW_SIZE, longestMember))
             var index = FIRST_GROUP_INDEX
             while (index < lastGroupStart) {
                 val groupEnd = minOf(index + GROUP_SIZE, lastGroupStart)
@@ -320,19 +326,52 @@ object FFProtector {
     ): Pair<IntArray, String>? {
         val count = lastGroupStart - FIRST_GROUP_INDEX
         if (count <= 0) return null
-        if (windows[lastGroupStart - 1].start + WINDOW_SIZE > end) return null
+        val n = windows.size
+
+        // Comprimento que o aplicador VAI escrever nesta janela. A ultima
+        // janela da secao nao e cortada em WINDOW_SIZE, entao quando ela cai
+        // dentro da faixa permutada o solver tem que modelar o tamanho real -
+        // senao o oraculo nunca fecha e caimos na tabela fixa.
+        fun lengthOf(index: Int): Int {
+            val at = windows[index].start
+            return if (index == n - 1) (end - at).toInt()
+            else minOf(WINDOW_SIZE.toLong(), end - at).toInt()
+        }
+
+        // Uma origem so serve se couber no comprimento do DESTINO. Se alguma
+        // nao couber o aplicador pula a janela e deixa cifrado, e ai nenhum
+        // CRC fecha: melhor nem tentar resolver.
+        for (k in 0 until count) {
+            val len = lengthOf(FIRST_GROUP_INDEX + k)
+            if (len <= 0) return null
+            val groupBase = FIRST_GROUP_INDEX + GROUP_SIZE * (k / GROUP_SIZE)
+            for (j in 0 until GROUP_SIZE) {
+                if (groupBase + j >= n) return null
+                if (windows[groupBase + j].start + len > end) return null
+            }
+        }
 
         val total = (end - start).toInt()
-        val zeroCrc = Crc32Affine.of(ByteArray(WINDOW_SIZE), 0, WINDOW_SIZE)
-        val keyCrc = Crc32Affine.of(ByteArray(WINDOW_SIZE) { key.toByte() }, 0, WINDOW_SIZE)
+
+        // So ha dois comprimentos possiveis (WINDOW_SIZE e a cauda), entao um
+        // cache minusculo evita recalcular os CRCs de apoio.
+        val zeroCache = HashMap<Int, Long>()
+        val keyCache = HashMap<Int, Long>()
+        fun zeroCrc(len: Int) = zeroCache.getOrPut(len) { Crc32Affine.of(ByteArray(len), 0, len) }
+        fun keyCrc(len: Int) = keyCache.getOrPut(len) {
+            Crc32Affine.of(ByteArray(len) { key.toByte() }, 0, len)
+        }
 
         var base = Crc32Affine.of(out, start.toInt(), total)
         val rests = LongArray(count)
+        val lens = IntArray(count)
         for (k in 0 until count) {
             val at = windows[FIRST_GROUP_INDEX + k].start
-            val rest = total.toLong() - (at - start) - WINDOW_SIZE
+            val len = lengthOf(FIRST_GROUP_INDEX + k)
+            val rest = total.toLong() - (at - start) - len
             rests[k] = rest
-            val present = Crc32Affine.of(out, at.toInt(), WINDOW_SIZE) xor zeroCrc
+            lens[k] = len
+            val present = Crc32Affine.of(out, at.toInt(), len) xor zeroCrc(len)
             base = base xor Crc32Affine.combine(present, 0L, rest)
         }
 
@@ -342,7 +381,7 @@ object FFProtector {
             val p = k % GROUP_SIZE
             for (j in 0 until GROUP_SIZE) {
                 val at = windows[groupBase + j].start
-                val term = Crc32Affine.of(data, at.toInt(), WINDOW_SIZE) xor keyCrc
+                val term = Crc32Affine.of(data, at.toInt(), lens[k]) xor keyCrc(lens[k])
                 aggregate[p][j] = aggregate[p][j] xor Crc32Affine.combine(term, 0L, rests[k])
             }
         }

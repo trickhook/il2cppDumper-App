@@ -10,8 +10,6 @@ object Crc32Affine {
         return crc.value
     }
 
-    fun ofZeros(length: Long): Long = combine(0L, 0L, length)
-
     fun combine(first: Long, second: Long, secondLength: Long): Long {
         if (secondLength <= 0L) return first
         val odd = LongArray(32)

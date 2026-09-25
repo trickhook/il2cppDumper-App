@@ -87,6 +87,32 @@ class ProtectorSyntheticTest {
     }
 
     @Test
+    fun `round trips a long last window that falls inside the permuted range`() {
+        // Geometria que o teste acima nao alcanca: com 0x120000 a secao tem 18
+        // janelas, entao lastGroupStart = 2 + 8 * ((18 - 2) / 8) = 18 = n e a
+        // ultima janela fica DENTRO da faixa permutada, na posicao 7 do grupo,
+        // medindo 0xE7A8 em vez de 0x4000. Isso ja estourou o buffer de staging
+        // e ja fez o solver modelar a janela com o tamanho errado.
+        val image = build(sectionSize = 0x120000, seed = 0xC56A888FL, algo = 1)
+
+        val result = FFProtector.tryUnpack(image.packed.copyOf())
+        assertEquals(18, result.windowsTotal)
+        assertEquals(18, result.windowsRecovered)
+        assertEquals(0, result.windowsSkipped)
+        assertTrue(result.checksumVerified)
+        assertTrue(
+            result.permutationSource.contains("CRC32 verified"),
+            "a permutacao tem que sair do oraculo, nao da tabela fixa: ${result.permutationSource}"
+        )
+        assertByteIdentical(image.plain, result.data)
+
+        // O app chama com inPlace = true, onde out e data sao o mesmo array.
+        val inPlace = FFProtector.tryUnpack(image.packed.copyOf(), inPlace = true)
+        assertTrue(inPlace.checksumVerified)
+        assertByteIdentical(image.plain, inPlace.data)
+    }
+
+    @Test
     fun `leaves window zero packed when the key blob is missing`() {
         val image = build(sectionSize = 0x143844, seed = 0xC56A888FL, algo = 1, includeBlob = false)
         val result = FFProtector.tryUnpack(image.packed)

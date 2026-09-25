@@ -49,7 +49,7 @@ fun CreditsScreen() {
         Link("github.com/trickhook/il2cppDumper-App")
 
         Spacer(Modifier.height(36.dp))
-        Text("v1.0", style = MaterialTheme.typography.bodySmall)
+        Text("v${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall)
     }
 }
 

@@ -40,6 +40,9 @@ fun CreditsScreen() {
                     "Dump completo de IL2CPP direto do APK, sem root",
                     style = MaterialTheme.typography.bodySmall
                 )
+                Spacer(Modifier.height(14.dp))
+                Link("github.com/trickhook")
+                Link("t.me/rootlocalhostt")
             }
         }
 
@@ -84,6 +87,18 @@ private fun Section(title: String, content: @Composable () -> Unit) {
         Spacer(Modifier.height(4.dp))
         content()
     }
+}
+
+@Composable
+private fun Link(text: String) {
+    Text(
+        text,
+        fontSize = 14.sp,
+        fontFamily = FontFamily.Monospace,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(vertical = 3.dp)
+    )
 }
 
 @Composable

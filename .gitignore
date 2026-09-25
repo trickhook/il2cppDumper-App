@@ -4,3 +4,6 @@ local.properties
 *.iml
 .idea/
 captures/
+
+# Log de erros do compilador Kotlin, recriado a cada build.
+.kotlin/

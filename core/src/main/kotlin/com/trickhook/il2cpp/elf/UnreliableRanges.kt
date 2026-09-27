@@ -33,6 +33,12 @@ class UnreliableRanges(val regions: List<UnreliableRegion>) {
     companion object {
         val NONE = UnreliableRanges(emptyList())
 
+        fun union(parts: List<UnreliableRanges>): UnreliableRanges {
+            val all = ArrayList<UnreliableRegion>()
+            for (part in parts) all += part.regions
+            return if (all.isEmpty()) NONE else UnreliableRanges(all)
+        }
+
         /**
          * The exact set of bytes the Free Fire style protector rewrites: a window
          * of [windowSize] every [slotStride], phased from the page below the

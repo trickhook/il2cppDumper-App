@@ -41,10 +41,9 @@ object DumpPipeline {
             onStage("Desempacotando")
             val unpack = SourceProtector.unpack(library)
             if (unpack.detected) {
-                onLog(unpack.report)
+                if (unpack.report.isNotEmpty()) onLog(unpack.report)
                 onLog(
-                    "  secao protegida 0x${unpack.protectedStart.toString(16)}.." +
-                        "0x${unpack.protectedEnd.toString(16)}; so esse prefixo foi para o heap " +
+                    "  so o prefixo ate o fim da secao foi para o heap " +
                         "(${unpack.stagedBytes} de ${library.size} bytes)"
                 )
             } else {
@@ -53,12 +52,20 @@ object DumpPipeline {
 
             onStage("Lendo o ELF")
             val elf = ElfImage.parse(library)
-            if (unpack.protectedRangeIsUnreliable) {
-                elf.unreliable = UnreliableRanges.protectorWindows(
-                    unpack.protectedStart,
-                    unpack.protectedEnd,
-                    "secao do protector nao recuperada (CRC32 nao fecha)"
+            // Toda secao cujo CRC32 nao fechou continua cifrada. As janelas dela
+            // ficam marcadas para que qualquer leitura de lá seja recusada em vez de
+            // emitida como se fosse dado real.
+            if (unpack.unrecovered.isNotEmpty()) {
+                elf.unreliable = UnreliableRanges.union(
+                    unpack.unrecovered.map { section ->
+                        UnreliableRanges.protectorWindows(
+                            section.start,
+                            section.endExclusive,
+                            "secao ${section.name} nao recuperada: ${section.note}"
+                        )
+                    }
                 )
+                for (section in unpack.unrecovered) onLog("  AINDA CIFRADA: $section")
                 onLog(
                     "  ${elf.unreliable.regions.size} janelas continuam cifradas; " +
                         "dados lidos delas serao recusados em vez de emitidos errados"

@@ -264,3 +264,54 @@ Found and deliberately left alone:
   diffed them. Hashes of this branch's CODM output, for whoever does:
   `dump.cs de710ebd5b83de09`, `script.json 27e87f99e9921db9`,
   `stringliteral.json db6727c80e328399`, `il2cpp.h 196473deec4a096e`.
+
+---
+
+## CORRECTION (added after this note was written) — the descriptor DOES carry all three sections
+
+This note claims above that CODM's `libunity.so` "contains exactly one protector
+descriptor magic" and that the other two encrypted sections are "not
+descriptor-discoverable" and must come from the decryptor's own knowledge.
+
+**That is wrong, and acting on it would hardcode section ranges that do not need to be
+hardcoded.** The observation was correct — there really is only one magic — but the
+conclusion does not follow. Only **entry 0** of the descriptor table carries the magic in
+its first dword; entries 1 and 2 hold unrelated values there. The table has an explicit
+entry-count field:
+
+```
+table + 0x18C   u32   number of entries        (3 in this build)
+table + 0x1A8         NUL-terminated base64 key material
+entries are 0x30 bytes apart
+```
+
+So the right way to enumerate is **read the count, then stride 0x30** — never scan for
+more magics.
+
+Doing that yields all three encrypted sections, and each one's own CRC32 from the
+descriptor proves the result. Verified by running the reference decryptor
+(`scratchpad/codm/rodata_decrypt.py`) against the untouched packed library:
+
+```
+.rodata  off=0x00373380 size=0x00997304  CRC 0xD49063CE = descriptor  MATCH  (10056452/10056452 bytes)
+.text    off=0x02F2B230 size=0x012C55B4  CRC 0x1F8A5F36 = descriptor  MATCH
+il2cpp   off=0x041F07E4 size=0x09122F94  CRC 0x80F6C280 = descriptor  MATCH
+```
+
+Practical consequences for the work that resumes here:
+
+- Nothing about the encrypted ranges needs to be hardcoded. Derive all of them from the
+  descriptor, and verify each with the CRC32 the descriptor already carries. A build whose
+  CRC does not close must be refused, not dumped.
+- The staging insight in this note still stands and is still the right fix: the descriptor
+  lives near the *end* of the library, so relocating its 0x200 bytes to offset 0 of a
+  section-sized buffer is what keeps the staged prefix at 13.7 MB instead of 243 MB.
+- The 152 MB `il2cpp` section genuinely cannot be staged through `FFProtector`'s
+  `ByteArray` API on a 512 MB heap — that part of the note is correct. It has to be
+  decrypted in place through the `MapMode.PRIVATE` mapping, window by window. The window
+  geometry is deterministic and stateless (no byte depends on any other), so windows can
+  be decrypted in any order and independently, which makes this straightforward.
+- CODM's parameters differ from Free Fire's: obfuscation constant **0x98** (FF uses 0x4F),
+  XOR key **0x52**, `FirstGroupIndex` **1** (FF uses 2), and a window permutation that
+  matches none of `KnownPermutations` — but it does not need to be listed, because the
+  existing CRC32 affine oracle solves it in about 27 seconds.

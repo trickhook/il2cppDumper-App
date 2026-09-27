@@ -700,3 +700,10 @@ struct MethodInfo
 
 private fun crlf(text: String): String =
     text.replace("\r\n", "\n").replace("\n", "\r\n")
+
+/**
+ * C struct name for a type the dump could not resolve, which in practice means its
+ * Il2CppType sits in a section the unpacker could not decrypt. Declared as an
+ * opaque struct in the header prologue so the generated C still compiles.
+ */
+internal const val UNRESOLVED_STRUCT_NAME = "Il2CppUnresolved"

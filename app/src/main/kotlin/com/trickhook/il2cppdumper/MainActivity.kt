@@ -172,6 +172,7 @@ private fun TargetPanel(state: DumperState, onBack: () -> Unit, onRun: () -> Uni
         Field("ABI", target.abi)
         Field("Versao", target.versionName)
         Field("Biblioteca", target.libraryPath)
+        Field("Escolhida porque", target.libraryReason)
         Field("APK da lib", target.librarySource.ifEmpty { "extraida" })
         Field("APK do metadata", target.metadataSource)
         Spacer(Modifier.height(20.dp))

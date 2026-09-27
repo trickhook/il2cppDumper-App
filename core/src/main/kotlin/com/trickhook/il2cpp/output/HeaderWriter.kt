@@ -284,13 +284,19 @@ class HeaderWriter(private val executor: Il2CppExecutor) {
     private fun buildVTable(typeDef: Il2CppTypeDefinition): Array<String?> {
         val bySlot = TreeMap<Int, Il2CppMethodDefinition>()
         for (index in 0 until typeDef.vtableCount) {
-            val encoded = metadata.vtableMethods[typeDef.vtableStart + index]
+            // A slot can be unresolvable when the method spec it points at was
+            // refused because it lay in a section we could not decrypt. Skipping it
+            // leaves a hole in the vtable, which is honest; on a clean image every
+            // lookup succeeds and the table is the same as before.
+            val encoded = metadata.vtableMethods.getOrNull(typeDef.vtableStart + index) ?: continue
             val usage = metadata.encodedIndexType(encoded)
             val decoded = metadata.decodeMethodIndex(encoded)
             val methodDef = if (usage == Il2CppMetadataUsage.METHOD_REF.ordinal) {
-                metadata.methodDefs[binary.methodSpecs[decoded].methodDefinitionIndex]
+                val spec = binary.methodSpecs.getOrNull(decoded) ?: continue
+                if (!binary.isUsableMethodSpec(spec)) continue
+                metadata.methodDefs[spec.methodDefinitionIndex]
             } else {
-                metadata.methodDefs[decoded]
+                metadata.methodDefs.getOrNull(decoded) ?: continue
             }
             if (methodDef.slot != 0xFFFF) bySlot[methodDef.slot] = methodDef
         }
@@ -567,6 +573,11 @@ class HeaderWriter(private val executor: Il2CppExecutor) {
                 else -> "Il2CppObject*"
             }
         }
+        // IL2CPP_TYPE_END is the blank type Il2CppBinary substitutes for an
+        // Il2CppType it refused to read out of a section it could not decrypt.
+        // A clean image never carries one, so this only replaces what used to
+        // be an exception; it never changes a dump that had no encrypted data.
+        Il2CppTypeEnum.IL2CPP_TYPE_END -> UNRESOLVED_STRUCT_NAME + "*"
         else -> throw UnsupportedOperationException("cannot render type ${type.type} as a C declaration")
     }
 
@@ -628,6 +639,7 @@ class HeaderWriter(private val executor: Il2CppExecutor) {
             if (inst == null) "System_Object"
             else getIl2CppStructName(genericArgument(inst, executor.getGenericParameterFromIl2CppType(type).num), null)
         }
+        Il2CppTypeEnum.IL2CPP_TYPE_END -> UNRESOLVED_STRUCT_NAME
         else -> throw UnsupportedOperationException("cannot name type ${type.type}")
     }
 

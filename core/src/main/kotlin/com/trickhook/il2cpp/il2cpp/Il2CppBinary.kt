@@ -1,6 +1,7 @@
 package com.trickhook.il2cpp.il2cpp
 
 import com.trickhook.il2cpp.elf.ElfImage
+import com.trickhook.il2cpp.elf.UnreliableRanges
 import com.trickhook.il2cpp.metadata.Il2CppMethodDefinition
 import com.trickhook.il2cpp.metadata.Il2CppRGCTXDefinition
 import com.trickhook.il2cpp.metadata.Metadata
@@ -10,6 +11,67 @@ private const val COUNT_SANITY_LIMIT = 0x50000L
 private val MISSING_GENERIC_INST = Il2CppGenericInst(0L, 0L)
 
 private val MISSING_TYPE_DEFINITION_SIZES = Il2CppTypeDefinitionSizes(0L, 0, 0L, 0L)
+
+private const val TYPE_DEFINITION_SIZES_BYTES = 16L
+
+private const val IL2CPP_TYPE_BYTES = 16L
+
+private val MISSING_METHOD_SPEC = Il2CppMethodSpec(-1, -1, -1)
+
+/**
+ * How much of the registration data survived unpacking. `clean` is the normal
+ * case; anything else means the dump must say so out loud.
+ */
+class BinaryIntegrity(
+    val fieldOffsetTablesTotal: Int,
+    val fieldOffsetTablesUnreliable: Int,
+    val typeSizeEntriesTotal: Int,
+    val typeSizeEntriesUnreliable: Int,
+    val typeEntriesTotal: Int,
+    val typeEntriesUnreliable: Int,
+    val unreliableArrays: List<String>,
+    val methodSpecsUnreliable: Int = 0,
+    val methodSpecsTotal: Int = 0,
+    val genericMethodTableUnreliable: Int = 0
+) {
+    val fieldOffsetsUsable: Boolean get() = fieldOffsetTablesUnreliable == 0
+    val typeSizesUsable: Boolean get() = typeSizeEntriesUnreliable == 0
+
+    val clean: Boolean
+        get() = fieldOffsetTablesUnreliable == 0 && typeSizeEntriesUnreliable == 0 &&
+            typeEntriesUnreliable == 0 && unreliableArrays.isEmpty() &&
+            methodSpecsUnreliable == 0 && genericMethodTableUnreliable == 0
+
+    fun lines(): List<String> {
+        if (clean) return emptyList()
+        val out = ArrayList<String>()
+        out += "ATENCAO: parte da imagem nao pode ser decifrada; dados abaixo NAO sao confiaveis."
+        if (fieldOffsetTablesUnreliable > 0) {
+            out += "  fieldOffsets: $fieldOffsetTablesUnreliable/$fieldOffsetTablesTotal tabelas " +
+                "caem na faixa cifrada - offsets de campo saem como 0xFFFFFFFF (desconhecido), nao como lixo"
+        }
+        if (typeSizeEntriesUnreliable > 0) {
+            out += "  typeDefinitionsSizes: $typeSizeEntriesUnreliable/$typeSizeEntriesTotal entradas " +
+                "na faixa cifrada - zeradas em vez de lixo"
+        }
+        if (typeEntriesUnreliable > 0) {
+            out += "  Il2CppType: $typeEntriesUnreliable/$typeEntriesTotal na faixa cifrada - " +
+                "tipos de campo/parametro podem estar errados"
+        }
+        if (methodSpecsUnreliable > 0) {
+            out += "  methodSpecs: $methodSpecsUnreliable/$methodSpecsTotal na faixa cifrada - " +
+                "essas instanciacoes genericas foram OMITIDAS do dump em vez de impressas erradas"
+        }
+        if (genericMethodTableUnreliable > 0) {
+            out += "  genericMethodTable: $genericMethodTableUnreliable entradas na faixa cifrada - omitidas"
+        }
+        if (unreliableArrays.isNotEmpty()) {
+            out += "  arrays que atravessam a faixa cifrada: ${unreliableArrays.joinToString(", ")}"
+        }
+        out += "  Dumpa a biblioteca da memoria (precisa de root) para ter esses dados corretos."
+        return out
+    }
+}
 
 class Il2CppBinary(
     val elf: ElfImage,
@@ -48,6 +110,22 @@ class Il2CppBinary(
     val methodSpecGenericMethodPointers: Map<Il2CppMethodSpec, Long>
     val rgctxs: Map<String, Map<Long, Array<Il2CppRGCTXDefinition>>>
 
+    /**
+     * What a packed image cost us. Clean when the whole file was plaintext;
+     * otherwise it says exactly which registration data landed in a range we could
+     * not decrypt, so the caller can report that instead of emitting numbers that
+     * merely look plausible.
+     */
+    val integrity: BinaryIntegrity
+
+    /** O que a busca pelas registrations teve que relaxar, para o log. */
+    val searchNotes: MutableList<String> = ArrayList()
+
+    private val unreliable: UnreliableRanges get() = elf.unreliable
+
+    private var unreliableMethodSpecs = 0
+    private var unreliableGenericMethodTable = 0
+
     init {
         var running = metadata.version
         var codeAddress = requestedCodeRegistration
@@ -64,6 +142,7 @@ class Il2CppBinary(
             )
             val foundCode = helper.findCodeRegistration()
             val foundMetadata = helper.findMetadataRegistration()
+            searchNotes.addAll(helper.notes)
             var adjusted = foundCode
             if (foundCode != 0L && running >= 24.2) {
                 val probe = readCodeRegistrationAt(foundCode, running)
@@ -156,21 +235,55 @@ class Il2CppBinary(
         } else {
             readUInt32Array(meta.fieldOffsets, meta.fieldOffsetsCount)
         }
+        var badFieldOffsetTables = 0
+        var totalFieldOffsetTables = 0
+        if (!elf.unreliable.isEmpty) {
+            if (fieldOffsetsArePointers) {
+                for (table in fieldOffsets) {
+                    if (table <= 0L) continue
+                    totalFieldOffsetTables++
+                    if (isUnreliableAt(table, 4L)) badFieldOffsetTables++
+                }
+            } else if (fieldOffsets.isNotEmpty()) {
+                totalFieldOffsetTables = 1
+                if (isUnreliableAt(meta.fieldOffsets, 4L * fieldOffsets.size)) {
+                    badFieldOffsetTables = 1
+                }
+            }
+        }
 
         val typePointers = readPointerArray(meta.types, meta.typesCount)
         val byAddress = HashMap<Long, Il2CppType>(typePointers.size)
         val missingType = Il2CppType(0L, 0, running)
+        var badTypes = 0
         types = Array(typePointers.size) { index ->
             val address = typePointers[index]
-            val type = readAt(address, missingType) { readIl2CppType(reader, running) }
+            // An Il2CppType whose 16 bytes came out of ciphertext carries a klass
+            // index of several hundred million. Substituting the blank type keeps
+            // the array indexable and makes the name come out as unresolved
+            // instead of crashing or, worse, naming the wrong class.
+            val type = if (isUnreliableAt(address, IL2CPP_TYPE_BYTES)) {
+                badTypes++
+                missingType
+            } else {
+                readAt(address, missingType) { readIl2CppType(reader, running) }
+            }
             byAddress[address] = type
             type
         }
         typeByAddress = byAddress
 
         val sizePointers = readPointerArray(meta.typeDefinitionsSizes, meta.typeDefinitionsSizesCount)
+        var badTypeSizes = 0
         typeDefinitionsSizes = Array(sizePointers.size) { index ->
-            readAt(sizePointers[index], MISSING_TYPE_DEFINITION_SIZES) { readTypeDefinitionSizes(reader) }
+            if (isUnreliableAt(sizePointers[index], TYPE_DEFINITION_SIZES_BYTES)) {
+                badTypeSizes++
+                MISSING_TYPE_DEFINITION_SIZES
+            } else {
+                readAt(sizePointers[index], MISSING_TYPE_DEFINITION_SIZES) {
+                    readTypeDefinitionSizes(reader)
+                }
+            }
         }
 
         val modules = LinkedHashMap<String, Il2CppCodeGenModule>()
@@ -202,19 +315,83 @@ class Il2CppBinary(
             if (entry.genericMethodIndex < 0 || entry.genericMethodIndex >= methodSpecs.size) continue
             if (entry.indices.methodIndex < 0 || entry.indices.methodIndex >= genericMethodPointers.size) continue
             val spec = methodSpecs[entry.genericMethodIndex]
+            if (!isUsableMethodSpec(spec)) continue
             specsByDefinition.getOrPut(spec.methodDefinitionIndex) { ArrayList() } += spec
             pointersBySpec[spec] = genericMethodPointers[entry.indices.methodIndex]
         }
         methodDefinitionMethodSpecs = specsByDefinition
         methodSpecGenericMethodPointers = pointersBySpec
+
+        integrity = BinaryIntegrity(
+            fieldOffsetTablesTotal = totalFieldOffsetTables,
+            fieldOffsetTablesUnreliable = badFieldOffsetTables,
+            typeSizeEntriesTotal = typeDefinitionsSizes.size,
+            typeSizeEntriesUnreliable = badTypeSizes,
+            typeEntriesTotal = types.size,
+            typeEntriesUnreliable = badTypes,
+            unreliableArrays = namedArrayRanges(code, meta, running)
+                .filter { isUnreliableAt(it.second, it.third) }
+                .map { it.first },
+            methodSpecsUnreliable = unreliableMethodSpecs,
+            methodSpecsTotal = methodSpecs.size,
+            genericMethodTableUnreliable = unreliableGenericMethodTable
+        )
+    }
+
+    private fun isUnreliableAt(address: Long, length: Long): Boolean {
+        if (unreliable.isEmpty || address == 0L || length <= 0L) return false
+        val at = elf.mapVaToOffset(address)
+        return at >= 0L && unreliable.overlaps(at, length)
+    }
+
+    /** Registration arrays worth naming in a report, as (name, address, byte length). */
+    private fun namedArrayRanges(
+        code: Il2CppCodeRegistration,
+        meta: Il2CppMetadataRegistration,
+        forVersion: Double
+    ): List<Triple<String, Long, Long>> = listOf(
+        Triple("metadataRegistration.types", meta.types, meta.typesCount * pointerSize),
+        Triple("metadataRegistration.fieldOffsets", meta.fieldOffsets, meta.fieldOffsetsCount * pointerSize),
+        Triple(
+            "metadataRegistration.typeDefinitionsSizes",
+            meta.typeDefinitionsSizes,
+            meta.typeDefinitionsSizesCount * pointerSize
+        ),
+        Triple("metadataRegistration.genericClasses", meta.genericClasses, meta.genericClassesCount * pointerSize),
+        Triple("metadataRegistration.genericInsts", meta.genericInsts, meta.genericInstsCount * pointerSize),
+        Triple("metadataRegistration.methodSpecs", meta.methodSpecs, meta.methodSpecsCount * SIZE_OF_METHOD_SPEC),
+        Triple(
+            "metadataRegistration.genericMethodTable",
+            meta.genericMethodTable,
+            meta.genericMethodTableCount * sizeOfGenericMethodFunctionsDefinitions(forVersion)
+        ),
+        Triple("metadataRegistration.metadataUsages", meta.metadataUsages, metadata.metadataUsagesCount * pointerSize),
+        Triple("codeRegistration.methodPointers", code.methodPointers, code.methodPointersCount * pointerSize),
+        Triple("codeRegistration.invokerPointers", code.invokerPointers, code.invokerPointersCount * pointerSize),
+        Triple("codeRegistration.codeGenModules", code.codeGenModules, code.codeGenModulesCount * pointerSize)
+    )
+
+    /**
+     * Whether a method spec can be named. A spec whose bytes came out of a range
+     * we could not decrypt has indices that point nowhere, and the bounds checks
+     * here also cover a plain malformed image.
+     */
+    fun isUsableMethodSpec(spec: Il2CppMethodSpec): Boolean {
+        if (spec.methodDefinitionIndex < 0 || spec.methodDefinitionIndex >= metadata.methodDefs.size) return false
+        if (spec.classIndexIndex < -1 || spec.classIndexIndex >= genericInsts.size) return false
+        if (spec.methodIndexIndex < -1 || spec.methodIndexIndex >= genericInsts.size) return false
+        return true
     }
 
     fun rva(pointer: Long): Long = elf.rva(pointer)
 
     fun mapVaToOffset(va: Long): Long = elf.mapVaToOffset(va)
 
-    fun readType(address: Long): Il2CppType =
-        readAt(address, Il2CppType(0L, 0, version)) { readIl2CppType(reader, version) }
+    fun readType(address: Long): Il2CppType {
+        val blank = Il2CppType(0L, 0, version)
+        if (isUnreliableAt(address, IL2CPP_TYPE_BYTES)) return blank
+        return readAt(address, blank) { readIl2CppType(reader, version) }
+    }
 
     fun genericClassAt(address: Long): Il2CppGenericClass? =
         readAt(address, null) { readGenericClass(reader, version) }
@@ -253,10 +430,13 @@ class Il2CppBinary(
                 if (at < 0L) return -1
                 val slot = at + 4L * fieldIndexInType
                 if (slot < 0L || slot + 4L > reader.size) return -1
+                // Refuse rather than hand back a number decoded from ciphertext.
+                if (unreliable.overlaps(slot, 4L)) return -1
                 offset = reader.int32At(slot)
             }
         } else {
             if (fieldIndex !in fieldOffsets.indices) return -1
+            if (integrity.fieldOffsetTablesUnreliable > 0) return -1
             offset = fieldOffsets[fieldIndex].toInt()
         }
         if (offset > 0 && isValueType && !isStatic) offset -= if (elf.is32Bit) 8 else 16
@@ -372,8 +552,20 @@ class Il2CppBinary(
     private fun readMethodSpecs(meta: Il2CppMetadataRegistration): Array<Il2CppMethodSpec> {
         val count = meta.methodSpecsCount
         if (!canRead(meta.methodSpecs, count, SIZE_OF_METHOD_SPEC)) return emptyArray()
-        seek(meta.methodSpecs)
-        return Array(count.toInt()) { readMethodSpec(reader) }
+        val base = elf.mapVaToOffset(meta.methodSpecs)
+        return Array(count.toInt()) { index ->
+            val at = base + index.toLong() * SIZE_OF_METHOD_SPEC
+            // These live in .rodata, which a packed library leaves partly
+            // encrypted. An entry read out of ciphertext yields indices that are
+            // out of range for genericInsts, so it is dropped rather than printed.
+            if (unreliable.overlaps(at, SIZE_OF_METHOD_SPEC.toLong())) {
+                unreliableMethodSpecs++
+                MISSING_METHOD_SPEC
+            } else {
+                reader.seek(at)
+                readMethodSpec(reader)
+            }
+        }
     }
 
     private fun readGenericMethodTable(
@@ -383,8 +575,18 @@ class Il2CppBinary(
         val count = meta.genericMethodTableCount
         val stride = sizeOfGenericMethodFunctionsDefinitions(forVersion)
         if (!canRead(meta.genericMethodTable, count, stride)) return emptyArray()
-        seek(meta.genericMethodTable)
-        return Array(count.toInt()) { readGenericMethodFunctionsDefinitions(reader, forVersion) }
+        val base = elf.mapVaToOffset(meta.genericMethodTable)
+        val out = ArrayList<Il2CppGenericMethodFunctionsDefinitions>(count.toInt())
+        for (index in 0 until count.toInt()) {
+            val at = base + index.toLong() * stride
+            if (unreliable.overlaps(at, stride.toLong())) {
+                unreliableGenericMethodTable++
+                continue
+            }
+            reader.seek(at)
+            out.add(readGenericMethodFunctionsDefinitions(reader, forVersion))
+        }
+        return out.toTypedArray()
     }
 
     private fun canRead(address: Long, count: Long, stride: Int): Boolean {

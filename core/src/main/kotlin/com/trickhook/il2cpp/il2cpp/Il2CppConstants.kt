@@ -2,6 +2,13 @@ package com.trickhook.il2cpp.il2cpp
 
 object Il2CppConstants {
 
+    /**
+     * Stand-in name for a type the dump could not resolve, which in practice means
+     * its Il2CppType sits in a section the unpacker could not decrypt. A plain
+     * identifier on purpose: it has to survive into il2cpp.h and be greppable.
+     */
+    const val UNRESOLVED_TYPE_NAME = "Il2CppUnresolved"
+
     const val FIELD_ATTRIBUTE_FIELD_ACCESS_MASK = 0x0007
     const val FIELD_ATTRIBUTE_COMPILER_CONTROLLED = 0x0000
     const val FIELD_ATTRIBUTE_PRIVATE = 0x0001

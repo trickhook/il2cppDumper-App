@@ -1,6 +1,8 @@
 package com.trickhook.il2cpp.elf
 
+import com.trickhook.il2cpp.io.ArrayByteSource
 import com.trickhook.il2cpp.io.BinaryReader
+import com.trickhook.il2cpp.io.ByteSource
 
 data class Segment(
     val type: Int,
@@ -55,6 +57,10 @@ private const val DT_JMPREL = 23L
 private const val DT_INIT_ARRAY = 25L
 private const val DT_FINI_ARRAY = 26L
 private const val DT_GNU_HASH = 0x6ffffef5L
+private const val DT_ANDROID_REL = 0x6000000FL
+private const val DT_ANDROID_RELSZ = 0x60000010L
+private const val DT_ANDROID_RELA = 0x60000011L
+private const val DT_ANDROID_RELASZ = 0x60000012L
 
 private const val EM_ARM = 40
 private const val EM_AARCH64 = 183
@@ -62,6 +68,13 @@ private const val EM_AARCH64 = 183
 private const val R_ARM_ABS32 = 2L
 private const val R_AARCH64_ABS64 = 257L
 private const val R_AARCH64_RELATIVE = 1027L
+
+// Android packed relocations ("APS2"). Group flags, from bionic's linker.
+private const val APS2_MAGIC = 0x32535041 // "APS2" little endian
+private const val RELOCATION_GROUPED_BY_INFO = 1L
+private const val RELOCATION_GROUPED_BY_OFFSET_DELTA = 2L
+private const val RELOCATION_GROUPED_BY_ADDEND = 4L
+private const val RELOCATION_GROUP_HAS_ADDEND = 8L
 
 private const val PHDR32_SIZE = 32
 private const val PHDR64_SIZE = 56
@@ -99,33 +112,51 @@ private fun List<Segment>.addressOf(offset: Long): Long {
     return -1L
 }
 
-private fun ByteArray.uint16At(offset: Long): Int {
-    val p = offset.toInt()
-    return (this[p].toInt() and 0xFF) or ((this[p + 1].toInt() and 0xFF) shl 8)
+private fun ByteSource.putUInt32(offset: Long, value: Long) {
+    putInt32(offset, (value and 0xFFFFFFFFL).toInt())
 }
 
-private fun ByteArray.putUInt32(offset: Long, value: Long) {
-    val p = offset.toInt()
-    this[p] = (value and 0xFF).toByte()
-    this[p + 1] = ((value ushr 8) and 0xFF).toByte()
-    this[p + 2] = ((value ushr 16) and 0xFF).toByte()
-    this[p + 3] = ((value ushr 24) and 0xFF).toByte()
-}
-
-private fun ByteArray.putUInt64(offset: Long, value: Long) {
+private fun ByteSource.putUInt64(offset: Long, value: Long) {
     putUInt32(offset, value and 0xFFFFFFFFL)
     putUInt32(offset + 4, value ushr 32)
 }
 
-private fun ByteArray.putWord(offset: Long, value: Long, wide: Boolean) {
+private fun ByteSource.putWord(offset: Long, value: Long, wide: Boolean) {
     if (wide) putUInt64(offset, value) else putUInt32(offset, value and 0xFFFFFFFFL)
+}
+
+private const val R_ARM_RELATIVE = 23L
+
+private const val MAX_PACKED_RELOCATIONS = 40_000_000L
+
+/**
+ * sleb128 reader over the packed relocation blob. Android's encoder emits signed
+ * LEB128 for every field, including the counts.
+ */
+private class Sleb128(private val data: ByteArray, private var at: Int) {
+    fun next(): Long {
+        var result = 0L
+        var shift = 0
+        var byte: Int
+        do {
+            byte = data[at++].toInt()
+            // Guard the shift explicitly: Kotlin's shl only uses the low 6 bits of
+            // the count, so a 10-byte sleb128 would wrap around and fold bits back
+            // into the low word. bionic accumulates in a size_t and lets the high
+            // bits fall off the end, which is what this reproduces.
+            if (shift < 64) result = result or ((byte.toLong() and 0x7F) shl shift)
+            shift += 7
+        } while (byte and 0x80 != 0)
+        if (shift < 64 && byte and 0x40 != 0) result = result or (-1L shl shift)
+        return result
+    }
 }
 
 private fun truncateToWidth(value: Long, wide: Boolean): Long =
     if (wide) value else value and 0xFFFFFFFFL
 
 class ElfImage private constructor(
-    val data: ByteArray,
+    val source: ByteSource,
     val is64: Boolean,
     val machine: Int,
     val entry: Long,
@@ -139,6 +170,13 @@ class ElfImage private constructor(
     var imageBase: Long = baseAddress
     var isDumped: Boolean = dumped
 
+    /**
+     * File ranges inside [source] that are known not to be plaintext. Set by
+     * whoever unpacked the image; consumers must consult it before trusting data
+     * they read, so a packed section can never be emitted as if it were real.
+     */
+    var unreliable: UnreliableRanges = UnreliableRanges.NONE
+
     val is32Bit: Boolean get() = !is64
 
     val pointerSize: Int get() = if (is64) 8 else 4
@@ -149,7 +187,7 @@ class ElfImage private constructor(
 
     fun rva(pointer: Long): Long = if (isDumped) pointer - imageBase else pointer
 
-    fun reader(): BinaryReader = BinaryReader(data).apply { is32Bit = !is64 }
+    fun reader(): BinaryReader = BinaryReader(source).apply { is32Bit = !is64 }
 
     fun hasDtInit(): Boolean = dynamic.any { it.tag == DT_INIT }
 
@@ -159,9 +197,135 @@ class ElfImage private constructor(
 
     fun symbolNamed(name: String): ElfSymbol? = symbols.firstOrNull { it.name == name }
 
+    /**
+     * Relocations actually applied by the last [applyRelocations] call, for the log.
+     * `format` is "" when the image needed none.
+     */
+    var relocationFormat: String = ""
+        private set
+    var relocationsApplied: Int = 0
+        private set
+    var relocationsUnsupported: Int = 0
+        private set
+
     fun applyRelocations() {
         if (isDumped) return
+        relocationFormat = ""
+        relocationsApplied = 0
+        relocationsUnsupported = 0
+        // A library may carry either the classic tables or Android's packed ones.
+        // Newer NDK builds ship only the packed form, and an image whose packed
+        // relocations are ignored comes out with every pointer in .data.rel.ro at
+        // zero, which looks exactly like "registrations not found".
         runCatching { if (is64) applyRela() else applyRel() }
+        runCatching { applyAndroidPacked() }
+    }
+
+    /**
+     * Applies DT_ANDROID_RELA / DT_ANDROID_REL, the "APS2" packed encoding: a
+     * stream of sleb128 groups where the offset, the info and the addend may each
+     * be shared across a whole group. Decoded exactly as bionic's
+     * `packed_reloc_iterator` does, because any drift here silently writes the
+     * wrong pointers rather than failing.
+     */
+    private fun applyAndroidPacked() {
+        val wide = is64
+        val tableVa = dynamicValue(if (wide) DT_ANDROID_RELA else DT_ANDROID_REL) ?: return
+        val tableSize = dynamicValue(if (wide) DT_ANDROID_RELASZ else DT_ANDROID_RELSZ) ?: return
+        if (tableSize <= 8L || tableSize > Int.MAX_VALUE.toLong()) return
+        val tableOffset = mapVaToOffset(tableVa)
+        if (tableOffset < 0L || tableOffset + tableSize > source.size) return
+        if (source.int32At(tableOffset) != APS2_MAGIC) return
+
+        val packed = source.slice(tableOffset, tableSize.toInt())
+        val stream = Sleb128(packed, 4)
+        val count = stream.next()
+        if (count <= 0L || count > MAX_PACKED_RELOCATIONS) return
+
+        var offset = stream.next()
+        var info = 0L
+        var addend = 0L
+        var groupSize = 0L
+        var groupFlags = 0L
+        var groupOffsetDelta = 0L
+        var inGroup = 0L
+        var applied = 0
+        var unsupported = 0
+
+        var index = 0L
+        while (index < count) {
+            if (inGroup == groupSize) {
+                groupSize = stream.next()
+                groupFlags = stream.next()
+                if (groupSize <= 0L) break
+                if (groupFlags and RELOCATION_GROUPED_BY_OFFSET_DELTA != 0L) {
+                    groupOffsetDelta = stream.next()
+                }
+                if (groupFlags and RELOCATION_GROUPED_BY_INFO != 0L) info = stream.next()
+                if (groupFlags and RELOCATION_GROUP_HAS_ADDEND != 0L &&
+                    groupFlags and RELOCATION_GROUPED_BY_ADDEND != 0L
+                ) {
+                    addend += stream.next()
+                } else if (groupFlags and RELOCATION_GROUP_HAS_ADDEND == 0L) {
+                    addend = 0L
+                }
+                inGroup = 0L
+            }
+
+            offset += if (groupFlags and RELOCATION_GROUPED_BY_OFFSET_DELTA != 0L) {
+                groupOffsetDelta
+            } else {
+                stream.next()
+            }
+            if (groupFlags and RELOCATION_GROUPED_BY_INFO == 0L) info = stream.next()
+            if (groupFlags and RELOCATION_GROUP_HAS_ADDEND != 0L &&
+                groupFlags and RELOCATION_GROUPED_BY_ADDEND == 0L
+            ) {
+                addend += stream.next()
+            }
+            index++
+            inGroup++
+
+            if (applyOne(offset, info, addend, wide)) applied++ else unsupported++
+        }
+
+        if (applied > 0 || unsupported > 0) {
+            relocationFormat = if (wide) "DT_ANDROID_RELA (APS2)" else "DT_ANDROID_REL (APS2)"
+            relocationsApplied = applied
+            relocationsUnsupported = unsupported
+        }
+    }
+
+    /** Writes one decoded relocation. Returns false when the type is not handled. */
+    private fun applyOne(virtualAddress: Long, info: Long, addend: Long, wide: Boolean): Boolean {
+        val type = info and if (wide) 0xFFFFFFFFL else 0xFFL
+        val symbolIndex = if (wide) (info ushr 32).toInt() else (info ushr 8).toInt()
+        val target = mapVaToOffset(virtualAddress)
+        val width = if (wide) 8L else 4L
+        if (target < 0L || target + width > source.size) return false
+        if (wide) {
+            val value = when (type) {
+                R_AARCH64_RELATIVE -> addend
+                R_AARCH64_ABS64 ->
+                    if (symbolIndex in symbols.indices) symbols[symbolIndex].value + addend else null
+                else -> null
+            } ?: return false
+            source.putUInt64(target, value)
+        } else {
+            val value = when (type) {
+                R_ARM_ABS32 ->
+                    if (symbolIndex in symbols.indices) {
+                        (symbols[symbolIndex].value + addend) and 0xFFFFFFFFL
+                    } else {
+                        null
+                    }
+                // R_ARM_RELATIVE with a zero load base leaves the word as linked.
+                R_ARM_RELATIVE -> return true
+                else -> null
+            } ?: return false
+            source.putUInt32(target, value)
+        }
+        return true
     }
 
     private fun applyRel() {
@@ -180,7 +344,7 @@ class ElfImage private constructor(
             if (symbolIndex !in symbols.indices) continue
             val target = mapVaToOffset(reader.uint32At(at))
             if (target < 0 || target + 4 > reader.size) continue
-            data.putUInt32(target, symbols[symbolIndex].value and 0xFFFFFFFFL)
+            source.putUInt32(target, symbols[symbolIndex].value and 0xFFFFFFFFL)
         }
     }
 
@@ -205,24 +369,32 @@ class ElfImage private constructor(
             } ?: continue
             val target = mapVaToOffset(reader.int64At(at))
             if (target < 0 || target + 8 > reader.size) continue
-            data.putUInt64(target, value)
+            source.putUInt64(target, value)
         }
     }
 
     companion object {
 
-        fun parse(data: ByteArray): ElfImage = build(data, 0L, false)
+        fun parse(data: ByteArray): ElfImage = build(ArrayByteSource(data), 0L, false)
 
-        fun parseDump(data: ByteArray, imageBase: Long): ElfImage = build(data, imageBase, true)
+        fun parseDump(data: ByteArray, imageBase: Long): ElfImage =
+            build(ArrayByteSource(data), imageBase, true)
 
-        private fun build(data: ByteArray, imageBase: Long, dumped: Boolean): ElfImage {
+        fun parse(source: ByteSource): ElfImage = build(source, 0L, false)
+
+        fun parseDump(source: ByteSource, imageBase: Long): ElfImage = build(source, imageBase, true)
+
+        /** True when [source] starts with an ELF magic of the expected class. */
+        fun looksLikeElf(source: ByteSource): Boolean =
+            source.size > 64 &&
+                source.uint8At(0) == 0x7F && source.uint8At(1) == 'E'.code &&
+                source.uint8At(2) == 'L'.code && source.uint8At(3) == 'F'.code
+
+        private fun build(data: ByteSource, imageBase: Long, dumped: Boolean): ElfImage {
             require(data.size > 64) { "buffer too small to hold an ELF header" }
-            require(
-                data[0].toInt() == 0x7F && data[1].toInt() == 'E'.code &&
-                    data[2].toInt() == 'L'.code && data[3].toInt() == 'F'.code
-            ) { "not an ELF image" }
+            require(looksLikeElf(data)) { "not an ELF image" }
 
-            val is64 = data[EI_CLASS].toInt() == ELFCLASS64
+            val is64 = data.uint8At(EI_CLASS.toLong()) == ELFCLASS64
             val reader = BinaryReader(data).apply { is32Bit = !is64 }
 
             reader.seek(18)
@@ -303,7 +475,7 @@ class ElfImage private constructor(
         }
 
         private fun rebaseSegments(
-            data: ByteArray,
+            data: ByteSource,
             segments: List<Segment>,
             tableOffset: Long,
             entrySize: Int,
@@ -349,7 +521,7 @@ class ElfImage private constructor(
         }
 
         private fun rebaseDynamic(
-            data: ByteArray,
+            data: ByteSource,
             dynamic: List<DynamicEntry>,
             ptDynamic: Segment?,
             imageBase: Long,
@@ -458,16 +630,16 @@ class ElfImage private constructor(
                         name = name,
                         value = reader.int64At(at + 8),
                         size = reader.int64At(at + 16),
-                        info = reader.data[(at + 4).toInt()].toInt() and 0xFF,
-                        shndx = reader.data.uint16At(at + 6)
+                        info = reader.uint8At(at + 4),
+                        shndx = reader.uint16At(at + 6)
                     )
                 } else {
                     ElfSymbol(
                         name = name,
                         value = reader.uint32At(at + 4),
                         size = reader.uint32At(at + 8),
-                        info = reader.data[(at + 12).toInt()].toInt() and 0xFF,
-                        shndx = reader.data.uint16At(at + 14)
+                        info = reader.uint8At(at + 12),
+                        shndx = reader.uint16At(at + 14)
                     )
                 }
             }

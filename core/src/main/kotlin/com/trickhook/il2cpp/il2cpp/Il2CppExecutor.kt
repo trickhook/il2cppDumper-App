@@ -25,6 +25,7 @@ import com.trickhook.il2cpp.il2cpp.Il2CppConstants.METHOD_ATTRIBUTE_REUSE_SLOT
 import com.trickhook.il2cpp.il2cpp.Il2CppConstants.METHOD_ATTRIBUTE_STATIC
 import com.trickhook.il2cpp.il2cpp.Il2CppConstants.METHOD_ATTRIBUTE_VIRTUAL
 import com.trickhook.il2cpp.il2cpp.Il2CppConstants.METHOD_ATTRIBUTE_VTABLE_LAYOUT_MASK
+import com.trickhook.il2cpp.il2cpp.Il2CppConstants.UNRESOLVED_TYPE_NAME
 import com.trickhook.il2cpp.io.BinaryReader
 import com.trickhook.il2cpp.metadata.Il2CppFieldDefinition
 import com.trickhook.il2cpp.metadata.Il2CppGenericContainer
@@ -77,6 +78,10 @@ class Il2CppExecutor(val metadata: Metadata, val binary: Il2CppBinary) {
     }
 
     fun getMethodSpecName(spec: Il2CppMethodSpec, addNamespace: Boolean = false): Pair<String, String> {
+        // A spec read out of a range we could not decrypt has indices that point
+        // nowhere. Il2CppBinary already drops those, and this is the belt to that
+        // braces: a malformed image must not take the whole dump down.
+        if (!binary.isUsableMethodSpec(spec)) return "<unresolved>" to "<unresolved>"
         val methodDef = metadata.methodDefs[spec.methodDefinitionIndex]
         val typeDef = metadata.typeDefs[methodDef.declaringType]
         val typeName = StringBuilder(getTypeDefName(typeDef, addNamespace, false))
@@ -139,7 +144,7 @@ class Il2CppExecutor(val metadata: Metadata, val binary: Il2CppBinary) {
         val base = metadata.header.attributeDataOffset
         val start = base + metadata.attributeDataRanges[attributeIndex].startOffset
         val end = base + metadata.attributeDataRanges[attributeIndex + 1].startOffset
-        val reader = CustomAttributeDataReader(this, metadata.raw.copyOfRange(start.toInt(), end.toInt()))
+        val reader = CustomAttributeDataReader(this, metadata.raw.slice(start, (end - start).toInt()))
         return (0 until reader.count).map { reader.readEntry() }
     }
 
@@ -190,6 +195,22 @@ class Il2CppExecutor(val metadata: Metadata, val binary: Il2CppBinary) {
         )
         return metadata.typeDefs[type.klassIndex]
     }
+
+    /**
+     * The same lookup as [getTypeDefinitionFromIl2CppType], but null instead of an
+     * exception when the type's class index is not a real type. That happens when
+     * the Il2CppType was read from a part of the image we could not decrypt: the
+     * index is then an arbitrary number. A well-formed image never takes this
+     * branch, so a clean dump is byte for byte unaffected.
+     */
+    private fun typeDefinitionOrNull(type: Il2CppType): Il2CppTypeDefinition? {
+        if (version >= 27.0 && binary.elf.isDumped) return null
+        return metadata.typeDefs.getOrNull(type.klassIndex)
+    }
+
+    private fun genericClassTypeDefinitionOrNull(genericClass: Il2CppGenericClass): Il2CppTypeDefinition? =
+        if (version >= 27.0) typeDefinitionOrNull(typeAt(genericClass.type))
+        else metadata.typeDefs.getOrNull(genericClass.typeDefinitionIndex.toInt())
 
     fun getGenericParameterFromIl2CppType(type: Il2CppType): Il2CppGenericParameter {
         if (version >= 27.0 && binary.elf.isDumped) throw UnsupportedOperationException(
@@ -253,13 +274,14 @@ class Il2CppExecutor(val metadata: Metadata, val binary: Il2CppBinary) {
 
     private fun declaredTypeName(type: Il2CppType, addNamespace: Boolean, isNested: Boolean): String {
         val genericClass = if (type.type == Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST) {
-            binary.genericClassAt(type.genericClass)
-                ?: throw IllegalStateException("generic class at 0x${type.genericClass.toString(16)} is not mapped")
+            binary.genericClassAt(type.genericClass) ?: return UNRESOLVED_TYPE_NAME
         } else {
             null
         }
-        val typeDef = if (genericClass != null) genericClassTypeDefinition(genericClass)
-        else getTypeDefinitionFromIl2CppType(type)
+        val typeDef = (
+            if (genericClass != null) genericClassTypeDefinitionOrNull(genericClass)
+            else typeDefinitionOrNull(type)
+            ) ?: return UNRESOLVED_TYPE_NAME
 
         val builder = StringBuilder()
         if (typeDef.declaringTypeIndex != -1) {
@@ -297,6 +319,10 @@ class Il2CppExecutor(val metadata: Metadata, val binary: Il2CppBinary) {
 
     private fun intrinsicName(type: Il2CppType): String {
         val kind = type.type ?: return "0x" + type.typeCode.toString(16)
+        // The blank type Il2CppBinary substitutes for an Il2CppType it refused to
+        // read out of an encrypted section. Naming it after the enum constant would
+        // put "IL2CPP_TYPE_END" in the dump as if it were a real type name.
+        if (kind == Il2CppTypeEnum.IL2CPP_TYPE_END) return UNRESOLVED_TYPE_NAME
         return intrinsicNames[kind] ?: kind.name
     }
 

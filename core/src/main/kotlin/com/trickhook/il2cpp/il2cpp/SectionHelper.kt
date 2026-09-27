@@ -24,10 +24,13 @@ class SectionHelper(
 
     private val reader = elf.reader()
     private val pointerSize = elf.pointerSize.toLong()
-    private val fileLength = elf.data.size.toLong()
+    private val fileLength = elf.source.size
 
     var pointerInExec: Boolean = false
         private set
+
+    /** Anything the search had to relax, for the log. */
+    val notes: MutableList<String> = ArrayList()
 
     fun findCodeRegistration(): Long {
         if (version < 24.2) return findCodeRegistrationOld()
@@ -89,13 +92,39 @@ class SectionHelper(
     }
 
     private fun findCodeRegistrationOld(): Long {
+        val exact = scanCodeRegistrationOld(methodCount.toLong(), methodCount.toLong())
+        if (exact != 0L) return exact
+        // Il2CppCodeRegistration.methodPointersCount does not have to equal the
+        // number of methods in the metadata: a build whose linker dropped
+        // unreferenced method bodies registers fewer. Call of Duty Mobile
+        // registers 470.836 pointers for 477.894 metadata methods, and insisting
+        // on equality finds nothing at all. So fall back to any smaller count
+        // whose table really is that many pointers all landing in executable
+        // sections, which is not something that happens by accident, and say in
+        // the log that the numbers disagree.
+        val floor = maxOf(1L, methodCount.toLong() / 2)
+        val relaxed = scanCodeRegistrationOld(floor, methodCount.toLong() - 1)
+        if (relaxed != 0L) {
+            notes += "CodeRegistration achada com methodPointersCount != contagem de metodos do metadata " +
+                "($lastCodeRegistrationCount vs $methodCount); normal quando o build descartou corpos nao " +
+                "referenciados, mas confira se os enderecos de metodo saem certos"
+        }
+        return relaxed
+    }
+
+    private var lastCodeRegistrationCount = 0L
+
+    private fun scanCodeRegistrationOld(minCount: Long, maxCount: Long): Long {
+        if (minCount > maxCount) return 0L
         for (section in data) {
             var position = section.offset
             val end = minOf(section.offsetEnd, fileLength) - pointerSize * 2
             while (position < end) {
-                if (reader.pointerAt(position) == methodCount.toLong()) {
+                val count = reader.pointerAt(position)
+                if (count in minCount..maxCount) {
                     val table = elf.mapVaToOffset(reader.pointerAt(position + pointerSize))
-                    if (isDataOffset(table) && allPointersInside(table, methodCount.toLong(), exec)) {
+                    if (isDataOffset(table) && allPointersInside(table, count, exec)) {
+                        lastCodeRegistrationCount = count
                         return position - section.offset + section.address
                     }
                 }
@@ -193,15 +222,32 @@ class SectionHelper(
         return hits
     }
 
+    /**
+     * Byte-pattern search over [from, to). Reads the window in chunks so it works
+     * the same on a heap array and on a mapping that may be hundreds of megabytes,
+     * and so it never needs the whole image resident.
+     */
     private fun occurrencesOf(pattern: ByteArray, from: Long, to: Long): List<Long> {
-        val bytes = elf.data
-        val last = minOf(to, fileLength).toInt() - pattern.size
-        val first = pattern[0]
+        val start = maxOf(from, 0L)
+        val end = minOf(to, fileLength)
         val hits = ArrayList<Long>()
-        var at = maxOf(from, 0L).toInt()
-        while (at <= last) {
-            if (bytes[at] == first && matchesAt(bytes, at, pattern)) hits += at.toLong()
-            at++
+        if (pattern.isEmpty() || end - start < pattern.size) return hits
+        val step = 1 shl 20
+        // Each chunk carries pattern.size - 1 bytes of overlap so a match that
+        // straddles a chunk boundary is still found.
+        val buffer = ByteArray(step + pattern.size - 1)
+        val first = pattern[0]
+        var base = start
+        while (base < end) {
+            val want = minOf(buffer.size.toLong(), end - base).toInt()
+            elf.source.copyOut(base, buffer, 0, want)
+            val last = want - pattern.size
+            var at = 0
+            while (at <= last) {
+                if (buffer[at] == first && matchesAt(buffer, at, pattern)) hits += base + at
+                at++
+            }
+            base += step
         }
         return hits
     }

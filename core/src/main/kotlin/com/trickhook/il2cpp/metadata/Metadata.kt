@@ -1,18 +1,42 @@
 package com.trickhook.il2cpp.metadata
 
+import com.trickhook.il2cpp.codm.CompactMetadata
+import com.trickhook.il2cpp.io.ArrayByteSource
 import com.trickhook.il2cpp.io.BinaryReader
+import com.trickhook.il2cpp.io.ByteSource
 import java.util.TreeMap
 
-class Metadata(source: ByteArray) {
+class Metadata(source: ByteSource) {
+
+    constructor(source: ByteArray) : this(ArrayByteSource(source))
 
     val obfuscationKey: Int = detectObfuscationKey(source)
 
-    val raw: ByteArray =
-        if (obfuscationKey == 0) source
-        else ByteArray(source.size) { (source[it].toInt() xor obfuscationKey).toByte() }
+    /**
+     * The plaintext metadata. When the file is XOR obfuscated there are two ways
+     * to undo it: a heap copy, which is what the historical `ByteArray` path did
+     * and keeps the caller's array untouched, or an in-place pass over the source.
+     * The second is the only option once the source is a 61 MB private mapping
+     * that must not be duplicated on the heap; it is safe because a PRIVATE
+     * mapping is copy-on-write and never reaches the file.
+     */
+    val raw: ByteSource = deobfuscate(source, obfuscationKey)
 
     private val reader = BinaryReader(raw)
     private var detectedVersion = 0.0
+
+    /**
+     * Anotacoes do parse que o chamador deve mostrar: deteccao de dialeto
+     * compacto e qualquer discordancia de contagem entre tabelas. Uma tabela lida
+     * com o stride errado produz um dump que parece perfeito, entao os avisos aqui
+     * sao a unica coisa que separa "certo" de "plausivel".
+     */
+    val warnings: MutableList<String> = ArrayList()
+
+    private var compactMetadata: CompactMetadata? = null
+
+    /** Nome do dialeto compacto em uso, ou "" quando o layout e o padrao. */
+    val compactDialect: String get() = compactMetadata?.name.orEmpty()
     private val stringCache = HashMap<Int, String>()
     private val fieldDefaultValuesByIndex: Map<Int, Il2CppFieldDefaultValue>
     private val parameterDefaultValuesByIndex: Map<Int, Il2CppParameterDefaultValue>
@@ -54,6 +78,24 @@ class Metadata(source: ByteArray) {
         detectedVersion = fileVersion.toDouble()
 
         var parsedHeader = readMetadataHeader(reader, detectedVersion)
+
+        // Antes de ler qualquer tabela: as tabelas de alguns jogos vem encolhidas,
+        // inclusive images, e a deteccao precisa acontecer antes de images ser
+        // lida. Nao ativa nada por nome de arquivo nem de pacote: sonda o stride
+        // padrao primeiro e so tenta o compacto se o padrao nao fechar.
+        compactMetadata = CompactMetadata.tryDetect(
+            reader = reader,
+            version = detectedVersion,
+            typeDefinitionsOffset = parsedHeader.typeDefinitionsOffset,
+            typeDefinitionsSize = parsedHeader.typeDefinitionsSize,
+            methodsSize = parsedHeader.methodsSize,
+            stringOffset = parsedHeader.stringOffset,
+            stringSize = parsedHeader.stringSize,
+            standardTypeDefSize = sizeOfTypeDefinition(detectedVersion),
+            standardMethodSize = sizeOfMethodDefinition(detectedVersion),
+            warnings = warnings
+        )
+
         if (fileVersion == 24) {
             if (parsedHeader.stringLiteralOffset == V242_STRING_LITERAL_OFFSET) {
                 detectedVersion = 24.2
@@ -69,29 +111,45 @@ class Metadata(source: ByteArray) {
         val v241Plus = detectedVersion == 24.1 &&
             parsedHeader.assembliesSize / V241_ASSEMBLY_SIZE == images.size
         if (v241Plus) detectedVersion = 24.4
-        val assemblies = readStructArray(
+        val assemblies = readTable(
+            CompactMetadata.TABLE_ASSEMBLIES,
             parsedHeader.assembliesOffset,
             parsedHeader.assembliesSize,
-            sizeOfAssemblyDefinition(detectedVersion)
+            sizeOfAssemblyDefinition(detectedVersion),
+            detectedVersion,
+            images.size.toLong()
         ) { readAssemblyDefinition(it, detectedVersion) }
         if (v241Plus) detectedVersion = 24.1
 
         val v = detectedVersion
-        val types = readStructArray(
+        // O token do typeDef nao existe no dialeto compacto e e sintetizado a
+        // partir da particao de tipos das imagens, entao isto tem que estar no
+        // lugar antes de typeDefinitions ser lida.
+        compactMetadata?.imageTypeRanges = images.map { it.typeStart until it.typeStart + it.typeCount }
+        val types = readTable(
+            CompactMetadata.TABLE_TYPE_DEFINITIONS,
             parsedHeader.typeDefinitionsOffset,
             parsedHeader.typeDefinitionsSize,
-            sizeOfTypeDefinition(v)
+            sizeOfTypeDefinition(v),
+            v,
+            -1L
         ) { readTypeDefinition(it, v) }
-        val methods = readMethodDefs(parsedHeader, types)
-        val parameters = readStructArray(
+        val methods = readMethods(parsedHeader, types, v)
+        val parameters = readTable(
+            CompactMetadata.TABLE_PARAMETERS,
             parsedHeader.parametersOffset,
             parsedHeader.parametersSize,
-            sizeOfParameterDefinition(v)
+            sizeOfParameterDefinition(v),
+            v,
+            methods.first.sumOf { it.parameterCount.toLong() }
         ) { readParameterDefinition(it, v) }
-        val fields = readStructArray(
+        val fields = readTable(
+            CompactMetadata.TABLE_FIELDS,
             parsedHeader.fieldsOffset,
             parsedHeader.fieldsSize,
-            sizeOfFieldDefinition(v)
+            sizeOfFieldDefinition(v),
+            v,
+            types.sumOf { it.fieldCount.toLong() }
         ) { readFieldDefinition(it, v) }
         val fieldDefaults = readStructArray(
             parsedHeader.fieldDefaultValuesOffset,
@@ -103,27 +161,39 @@ class Metadata(source: ByteArray) {
             parsedHeader.parameterDefaultValuesSize,
             SIZE_OF_PARAMETER_DEFAULT_VALUE
         ) { readParameterDefaultValue(it) }
-        val properties = readStructArray(
+        val properties = readTable(
+            CompactMetadata.TABLE_PROPERTIES,
             parsedHeader.propertiesOffset,
             parsedHeader.propertiesSize,
-            sizeOfPropertyDefinition(v)
+            sizeOfPropertyDefinition(v),
+            v,
+            types.sumOf { it.propertyCount.toLong() }
         ) { readPropertyDefinition(it, v) }
         val interfaces = readIntArray(parsedHeader.interfacesOffset, parsedHeader.interfacesSize)
         val nestedTypes = readIntArray(parsedHeader.nestedTypesOffset, parsedHeader.nestedTypesSize)
-        val events = readStructArray(
+        val events = readTable(
+            CompactMetadata.TABLE_EVENTS,
             parsedHeader.eventsOffset,
             parsedHeader.eventsSize,
-            sizeOfEventDefinition(v)
+            sizeOfEventDefinition(v),
+            v,
+            types.sumOf { it.eventCount.toLong() }
         ) { readEventDefinition(it, v) }
-        val containers = readStructArray(
+        val containers = readTable(
+            CompactMetadata.TABLE_GENERIC_CONTAINERS,
             parsedHeader.genericContainersOffset,
             parsedHeader.genericContainersSize,
-            SIZE_OF_GENERIC_CONTAINER
+            SIZE_OF_GENERIC_CONTAINER,
+            v,
+            -1L
         ) { readGenericContainer(it) }
-        val parametersOfGenerics = readStructArray(
+        val parametersOfGenerics = readTable(
+            CompactMetadata.TABLE_GENERIC_PARAMETERS,
             parsedHeader.genericParametersOffset,
             parsedHeader.genericParametersSize,
-            SIZE_OF_GENERIC_PARAMETER
+            SIZE_OF_GENERIC_PARAMETER,
+            v,
+            containers.sumOf { it.typeArgc.toLong() }
         ) { readGenericParameter(it) }
         val constraints = readIntArray(
             parsedHeader.genericParameterConstraintsOffset,
@@ -140,16 +210,22 @@ class Metadata(source: ByteArray) {
         var usages: Map<Il2CppMetadataUsage, Map<Long, Long>> = emptyMap()
         var usagesTotal = 0L
         if (v > 16.0) {
-            refs = readStructArray(
+            refs = readTable(
+                CompactMetadata.TABLE_FIELD_REFS,
                 parsedHeader.fieldRefsOffset,
                 parsedHeader.fieldRefsSize,
-                SIZE_OF_FIELD_REF
+                SIZE_OF_FIELD_REF,
+                v,
+                -1L
             ) { readFieldRef(it) }
             if (v < 27.0) {
-                val usageLists = readStructArray(
+                val usageLists = readTable(
+                    CompactMetadata.TABLE_METADATA_USAGE_LISTS,
                     parsedHeader.metadataUsageListsOffset,
                     parsedHeader.metadataUsageListsCount,
-                    SIZE_OF_METADATA_USAGE_LIST
+                    SIZE_OF_METADATA_USAGE_LIST,
+                    v,
+                    -1L
                 ) { readMetadataUsageList(it) }
                 val usagePairs = readStructArray(
                     parsedHeader.metadataUsagePairsOffset,
@@ -165,10 +241,13 @@ class Metadata(source: ByteArray) {
         var typeRanges = emptyArray<Il2CppCustomAttributeTypeRange>()
         var typeIndices = IntArray(0)
         if (v > 20.0 && v < 29.0) {
-            typeRanges = readStructArray(
+            typeRanges = readTable(
+                CompactMetadata.TABLE_ATTRIBUTES_INFO,
                 parsedHeader.attributesInfoOffset,
                 parsedHeader.attributesInfoCount,
-                sizeOfCustomAttributeTypeRange(v)
+                sizeOfCustomAttributeTypeRange(v),
+                v,
+                -1L
             ) { readCustomAttributeTypeRange(it, v) }
             typeIndices = readIntArray(parsedHeader.attributeTypesOffset, parsedHeader.attributeTypesCount)
         }
@@ -224,8 +303,10 @@ class Metadata(source: ByteArray) {
 
     fun getStringLiteral(index: Int): String {
         val literal = stringLiterals[index]
-        val start = (header.stringLiteralDataOffset + literal.dataIndex).toInt()
-        return String(raw, start, literal.length, Charsets.UTF_8)
+        // Long arithmetic on purpose: dataIndex is an Int but the sum with the
+        // section offset is a file offset and must not wrap on a large metadata.
+        val start = header.stringLiteralDataOffset + literal.dataIndex.toLong()
+        return raw.stringAt(start, literal.length)
     }
 
     fun getFieldDefaultValue(index: Int): Il2CppFieldDefaultValue? = fieldDefaultValuesByIndex[index]
@@ -260,11 +341,68 @@ class Metadata(source: ByteArray) {
         if (detectedVersion >= 27.0) (encoded and 0x1FFFFFFE) ushr 1 else encoded and 0x1FFFFFFF
 
     private fun readImageDefs(source: MetadataHeader): Array<Il2CppImageDefinition> =
-        readStructArray(
+        readTable(
+            CompactMetadata.TABLE_IMAGES,
             source.imagesOffset,
             source.imagesSize,
-            sizeOfImageDefinition(detectedVersion)
+            sizeOfImageDefinition(detectedVersion),
+            detectedVersion,
+            -1L
         ) { readImageDefinition(it, detectedVersion) }
+
+    /**
+     * Uma tabela de structs, transcodificada primeiro quando o dialeto compacto
+     * cobre ela. [expectedCount] e quantas entradas as tabelas ja lidas dizem que
+     * esta deveria ter, ou -1 quando nao da para saber: e essa checagem que
+     * distingue um stride de verdade de um multiplo dele, porque validade de nome
+     * passa nos dois.
+     */
+    private inline fun <reified T> readTable(
+        table: String,
+        offset: Long,
+        byteSize: Int,
+        standardSize: Int,
+        version: Double,
+        expectedCount: Long,
+        noinline read: (BinaryReader) -> T
+    ): Array<T> {
+        val compact = compactMetadata
+        if (compact != null && compact.handles(table)) {
+            val transcoded = compact.transcode(
+                reader, table, offset, byteSize, standardSize, version, expectedCount, read
+            )
+            if (transcoded != null) return transcoded.toTypedArray()
+        }
+        return readStructArray(offset, byteSize, standardSize, read)
+    }
+
+    /**
+     * Os metodos. Dois dialetos concorrem aqui: o do Free Fire, cujo registro e
+     * MAIOR que o padrao por causa de um campo extra (resolvido por
+     * [readMethodDefs] procurando onde o padding cai), e o compacto, cujo registro
+     * e MENOR. Sao problemas opostos, por isso caminhos separados.
+     */
+    private fun readMethods(
+        source: MetadataHeader,
+        types: Array<Il2CppTypeDefinition>,
+        version: Double
+    ): Pair<Array<Il2CppMethodDefinition>, MethodDefLayout> {
+        val compact = compactMetadata
+        if (compact == null || !compact.handles(CompactMetadata.TABLE_METHODS)) {
+            return readMethodDefs(source, types)
+        }
+        val standard = sizeOfMethodDefinition(version)
+        val defs = readTable(
+            CompactMetadata.TABLE_METHODS,
+            source.methodsOffset,
+            source.methodsSize,
+            standard,
+            version,
+            types.sumOf { it.methodCount.toLong() }
+        ) { readMethodDefinition(it, version) }
+        val stride = compact.strideOf(CompactMetadata.TABLE_METHODS)
+        return defs to MethodDefLayout(defs.size, stride, standard, 0, 0, 1.0)
+    }
 
     private inline fun <reified T> readStructArray(
         offset: Long,
@@ -496,12 +634,33 @@ class Metadata(source: ByteArray) {
         const val SANITY = 0xFAB11BAFL
         private val SANITY_BYTES = byteArrayOf(0xAF.toByte(), 0x1B, 0xB1.toByte(), 0xFA.toByte())
 
-        fun detectObfuscationKey(source: ByteArray): Int {
+        fun deobfuscate(source: ByteSource, key: Int): ByteSource {
+            if (key == 0) return source
+            val array = source.array
+            if (array != null) {
+                return ArrayByteSource(
+                    ByteArray(array.size) { (array[it].toInt() xor key).toByte() }
+                )
+            }
+            var at = 0L
+            val end = source.size
+            val chunk = ByteArray(1 shl 16)
+            while (at < end) {
+                val length = minOf(chunk.size.toLong(), end - at).toInt()
+                source.copyOut(at, chunk, 0, length)
+                for (i in 0 until length) chunk[i] = (chunk[i].toInt() xor key).toByte()
+                source.copyIn(at, chunk, 0, length)
+                at += length
+            }
+            return source
+        }
+
+        fun detectObfuscationKey(source: ByteSource): Int {
             if (source.size < 0x110) return 0
-            val key = (source[0].toInt() xor SANITY_BYTES[0].toInt()) and 0xFF
+            val key = (source.uint8At(0) xor SANITY_BYTES[0].toInt()) and 0xFF
             if (key == 0) return 0
             for (i in SANITY_BYTES.indices) {
-                if (((source[i].toInt() xor SANITY_BYTES[i].toInt()) and 0xFF) != key) return 0
+                if ((source.uint8At(i.toLong()) xor SANITY_BYTES[i].toInt()) and 0xFF != key) return 0
             }
             val version = readLittleInt(source, 4, key)
             if (version !in MIN_VERSION..MAX_VERSION) return 0
@@ -514,14 +673,14 @@ class Metadata(source: ByteArray) {
                 if (offset > 0) highest = maxOf(highest, offset.toLong() + size)
                 index += 8
             }
-            return if (highest in 1..source.size.toLong()) key else 0
+            return if (highest in 1..source.size) key else 0
         }
 
-        private fun readLittleInt(source: ByteArray, at: Int, key: Int): Int =
-            ((source[at].toInt() xor key) and 0xFF) or
-                (((source[at + 1].toInt() xor key) and 0xFF) shl 8) or
-                (((source[at + 2].toInt() xor key) and 0xFF) shl 16) or
-                (((source[at + 3].toInt() xor key) and 0xFF) shl 24)
+        private fun readLittleInt(source: ByteSource, at: Int, key: Int): Int =
+            ((source.uint8At(at.toLong()) xor key) and 0xFF) or
+                (((source.uint8At(at + 1L) xor key) and 0xFF) shl 8) or
+                (((source.uint8At(at + 2L) xor key) and 0xFF) shl 16) or
+                (((source.uint8At(at + 3L) xor key) and 0xFF) shl 24)
 
         const val MIN_VERSION = 16
         const val MAX_VERSION = 31

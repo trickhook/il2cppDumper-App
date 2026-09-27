@@ -274,15 +274,29 @@ class ScriptWriter(private val executor: Il2CppExecutor) {
     }
 
     private fun writeFieldUsage(json: JsonWriter, index: Int, address: Long) {
-        val fieldRef = metadata.fieldRefs[index]
-        val type = binary.types[fieldRef.typeIndex]
-        val typeDef = metadata.typeDefs[declaringTypeIndexOf(type)]
-        val fieldDef = metadata.fieldDefs[typeDef.fieldStart + fieldRef.fieldIndex]
+        // Every step here can fail on an image whose Il2CppTypes came out of a
+        // section we could not decrypt: the type resolves to the wrong class, and a
+        // class with no fields has fieldStart -1. The address is still real, so the
+        // entry is kept and only the name says it is unresolved. On a clean image
+        // all four lookups succeed and the output is unchanged.
+        val fieldRef = metadata.fieldRefs.getOrNull(index)
+        val type = fieldRef?.let { binary.types.getOrNull(it.typeIndex) }
+        val typeDef = type?.let { metadata.typeDefs.getOrNull(declaringTypeIndexOf(it)) }
+        val fieldDef = if (typeDef != null && fieldRef != null && typeDef.fieldStart >= 0) {
+            metadata.fieldDefs.getOrNull(typeDef.fieldStart + fieldRef.fieldIndex)
+        } else {
+            null
+        }
         json.beginObject()
         json.property("Address", binary.rva(address))
         json.property(
             "Name",
-            FIELD_PREFIX + executor.getTypeName(type, true, false) + "." + metadata.getString(fieldDef.nameIndex)
+            if (type == null || fieldDef == null) {
+                FIELD_PREFIX + UNRESOLVED_STRUCT_NAME
+            } else {
+                FIELD_PREFIX + executor.getTypeName(type, true, false) + "." +
+                    metadata.getString(fieldDef.nameIndex)
+            }
         )
         json.name("Signature").nullValue()
         json.endObject()
@@ -357,7 +371,7 @@ class ScriptWriter(private val executor: Il2CppExecutor) {
             if (version > 16.0) replayRecordedUsages(action)
             return
         }
-        val length = elf.data.size.toLong()
+        val length = elf.source.size
         for (region in dataRegions) {
             var position = region.offset
             val end = minOf(region.offsetEnd, length) - pointerSize
@@ -451,6 +465,11 @@ class ScriptWriter(private val executor: Il2CppExecutor) {
             val argument = genericArgument(type, arguments)
             if (argument == null) "Il2CppObject*" else parseType(argument, null)
         }
+        // IL2CPP_TYPE_END is the blank type Il2CppBinary substitutes for an
+        // Il2CppType it refused to read out of a section it could not decrypt. A
+        // clean image never has one, so this only changes output that used to be an
+        // exception.
+        Il2CppTypeEnum.IL2CPP_TYPE_END -> UNRESOLVED_STRUCT_NAME + "*"
         else -> throw UnsupportedOperationException("cannot render il2cpp type ${type.type} as a C type")
     }
 
@@ -470,6 +489,11 @@ class ScriptWriter(private val executor: Il2CppExecutor) {
             if (argument == null) "System_Object" else il2CppStructName(argument, null)
         }
         in DEFINITION_BACKED_TYPES -> names.structNames[type.klassIndex]
+        // IL2CPP_TYPE_END is the blank type Il2CppBinary substitutes for an
+        // Il2CppType it refused to read out of a section it could not decrypt.
+        // A clean image never carries one, so this only replaces what used to
+        // be an exception; it never changes a dump that had no encrypted data.
+        Il2CppTypeEnum.IL2CPP_TYPE_END -> UNRESOLVED_STRUCT_NAME
         else -> throw UnsupportedOperationException("no il2cpp struct name for ${type.type}")
     }
 
@@ -609,7 +633,10 @@ class ScriptWriter(private val executor: Il2CppExecutor) {
         Il2CppTypeEnum.IL2CPP_TYPE_U,
         Il2CppTypeEnum.IL2CPP_TYPE_OBJECT,
         Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY,
-        Il2CppTypeEnum.IL2CPP_TYPE_MVAR -> 'i'
+        Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+        // The blank type stands in for one we refused to read out of an encrypted
+        // section; it is pointer sized like everything else in this group.
+        Il2CppTypeEnum.IL2CPP_TYPE_END -> 'i'
         else -> throw UnsupportedOperationException("no method type signature letter for $type")
     }
 

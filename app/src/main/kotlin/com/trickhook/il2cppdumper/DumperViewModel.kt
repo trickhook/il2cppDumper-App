@@ -65,6 +65,7 @@ class DumperViewModel(application: Application) : AndroidViewModel(application) 
                     DumpPipeline.run(
                         target = target,
                         outputDir = output,
+                        cacheDir = getApplication<Application>().cacheDir,
                         dummyDllAttributes = readDummyDllAttributes(),
                         onStage = { stage ->
                             Log.i(TAG, "stage: $stage")

@@ -19,3 +19,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "ff-il2cppdumper-mobile"
 include(":core")
+include(":app")

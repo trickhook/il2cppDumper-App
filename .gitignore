@@ -7,3 +7,7 @@ captures/
 
 # Log de erros do compilador Kotlin, recriado a cada build.
 .kotlin/
+
+# Saida de build do validador de DLL
+tools/**/bin/
+tools/**/obj/
